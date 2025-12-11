@@ -1,0 +1,8 @@
+{
+    "conventionalCommits.scopes": [
+        "added emojis with greetings",
+        "frontend"
+    ],
+    "pieces.cloudCapabilities": "Blended",
+    "pieces.telemetry": true
+}
