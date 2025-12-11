@@ -1,0 +1,75 @@
+name: Build and Deploy to Azure VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          port: 22
+          source: "."
+          target: "/tmp/shivawebapp-deploy"
+          strip_components: 0
+
+      - name: Deploy to Azure VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          port: 22
+          script_stop: true
+          script: |
+            set -e
+            
+            cd /home/humacv2admin/humacv2/
+            
+            # Copy files to deployment directory
+            echo "Copying files to deployment directory..."
+            cp -r /tmp/shivawebapp-deploy/* ./shivawebapp/
+            
+            # Stop and remove existing container
+            echo "Stopping existing container..."
+            docker stop shivawebapp || true
+            docker rm shivawebapp || true
+            
+            # Remove old image
+            echo "Removing old Docker image..."
+            docker rmi shivawebapp:latest || true
+            
+            # Build new Docker image
+            echo "Building new Docker image..."
+            cd shivawebapp
+            docker build -t shivawebapp:latest .
+            
+            # Start container using docker compose
+            echo "Starting container with docker compose..."
+            cd ..
+            docker compose up -d shivawebapp
+            
+            # Cleanup old images and temporary files
+            echo "Cleaning up..."
+            docker image prune -f
+            rm -rf /tmp/shivawebapp-deploy
+            
+            # Show running containers
+            echo "Deployment completed. Running containers:"
+            docker ps | grep shivawebapp || echo "Container may still be starting..."
