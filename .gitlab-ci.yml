@@ -1,5 +1,6 @@
 # builds docker image and pushes to Gitlab container.
 # Then deploys to Azure VM  
+# Docker image is built using the Dockerfile in the shivawebapp directory.
 image: docker:20.10.16
 
 services:
