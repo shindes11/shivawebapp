@@ -10,9 +10,9 @@ env:
   IMAGE_NAME: shivawebapp
   CONTAINER_NAME: shivawebapp
   DEPLOY_DIR: /home/humacv2admin/humacv2
-  PID_FILE: /var/run/shivawebapp.pid
-  BACKUP_DIR: /var/backups/shivawebapp
-  LOG_DIR: /var/log/shivawebapp
+  PID_FILE: /home/humacv2admin/humacv2/.shivawebapp/shivawebapp.pid
+  BACKUP_DIR: /home/humacv2admin/humacv2/.shivawebapp/backups
+  LOG_DIR: /home/humacv2admin/humacv2/.shivawebapp/logs
 
 jobs:
   deploy:
@@ -61,7 +61,7 @@ jobs:
             LOG_DIR="${{ env.LOG_DIR }}"
             TEMP_DEPLOY="/tmp/shivawebapp-deploy"
             
-            # Create necessary directories
+            # Create necessary directories (user-writable locations in deploy directory)
             mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
             
             # ============================================
