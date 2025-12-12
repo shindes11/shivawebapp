@@ -40,12 +40,6 @@ jobs:
           script: |
             set -e
             
-            cd /home/humacv2admin/humacv2/
-            
-            # Copy files to deployment directory
-            echo "Copying files to deployment directory..."
-            cp -r /tmp/shivawebapp-deploy/* ./shivawebapp/
-            
             # Stop and remove existing container
             echo "Stopping existing container..."
             docker stop shivawebapp || true
@@ -55,14 +49,14 @@ jobs:
             echo "Removing old Docker image..."
             docker rmi shivawebapp:latest || true
             
-            # Build new Docker image
-            echo "Building new Docker image..."
-            cd shivawebapp
+            # Build new Docker image directly from temp directory
+            echo "Building new Docker image from deployment files..."
+            cd /tmp/shivawebapp-deploy
             docker build -t shivawebapp:latest .
             
             # Start container using docker compose
             echo "Starting container with docker compose..."
-            cd ..
+            cd /home/humacv2admin/humacv2/
             docker compose up -d shivawebapp
             
             # Cleanup old images and temporary files
