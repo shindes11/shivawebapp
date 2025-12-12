@@ -329,20 +329,20 @@ jobs:
             # Verify docker-compose.yml exists
             if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
               log "⚠ WARNING: docker-compose.yml not found, creating basic one..."
-              cat > docker-compose.yml <<EOF
-version: '3.8'
-services:
-  $CONTAINER_NAME:
-    image: $IMAGE_NAME:latest
-    container_name: $CONTAINER_NAME
-    restart: unless-stopped
-    ports:
-      - "3001:3001"
-    environment:
-      - NODE_ENV=production
-      - PORT=3001
-      - HOSTNAME=0.0.0.0
-EOF
+              {
+                echo "version: '3.8'"
+                echo "services:"
+                echo "  $CONTAINER_NAME:"
+                echo "    image: $IMAGE_NAME:latest"
+                echo "    container_name: $CONTAINER_NAME"
+                echo "    restart: unless-stopped"
+                echo "    ports:"
+                echo "      - \"3001:3001\""
+                echo "    environment:"
+                echo "      - NODE_ENV=production"
+                echo "      - PORT=3001"
+                echo "      - HOSTNAME=0.0.0.0"
+              } > docker-compose.yml
               log "  Created basic docker-compose.yml"
             fi
             
