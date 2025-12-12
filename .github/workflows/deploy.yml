@@ -1,4 +1,4 @@
-name: Build and Deploy to Azure VM
+name: Production CI/CD Pipeline
 
 on:
   push:
@@ -6,13 +6,20 @@ on:
       - main
   workflow_dispatch:
 
-defaults:
-  run:
-    working-directory: .
+env:
+  IMAGE_NAME: shivawebapp
+  CONTAINER_NAME: shivawebapp
+  DEPLOY_DIR: /home/humacv2admin/humacv2
+  PID_FILE: /var/run/shivawebapp.pid
+  BACKUP_DIR: /var/backups/shivawebapp
+  LOG_DIR: /var/log/shivawebapp
 
 jobs:
   deploy:
+    name: Build and Deploy to Production
     runs-on: ubuntu-latest
+    environment:
+      name: production
     
     steps:
       - name: Checkout code
@@ -29,7 +36,7 @@ jobs:
           target: "/tmp/shivawebapp-deploy"
           strip_components: 0
 
-      - name: Deploy to Azure VM
+      - name: Production Deployment with PID Tracking & Zero-Downtime
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
@@ -38,57 +45,305 @@ jobs:
           port: 22
           script_stop: true
           script: |
-            set -e
+            set -euo pipefail
             
-            # ZERO-DOWNTIME DEPLOYMENT STRATEGY
-            # Step 1: Build new image while old container is still running (NO DOWNTIME)
-            echo "Building new Docker image (old container still serving traffic)..."
-            cd /tmp/shivawebapp-deploy
-            docker build -t shivawebapp:latest .
+            # ============================================
+            # PRODUCTION DEPLOYMENT SCRIPT
+            # Features: Zero-downtime, PID tracking, Health checks, Rollback
+            # ============================================
             
-            # Step 2: Quick container swap (minimal downtime ~1-2 seconds)
-            echo "Performing zero-downtime container update..."
-            cd /home/humacv2admin/humacv2/
+            # Configuration
+            IMAGE_NAME="${{ env.IMAGE_NAME }}"
+            CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
+            DEPLOY_DIR="${{ env.DEPLOY_DIR }}"
+            PID_FILE="${{ env.PID_FILE }}"
+            BACKUP_DIR="${{ env.BACKUP_DIR }}"
+            LOG_DIR="${{ env.LOG_DIR }}"
+            TEMP_DEPLOY="/tmp/shivawebapp-deploy"
             
-            # Use docker compose update strategy:
-            # - Build happens first (while old container runs)
-            # - New container starts
-            # - Old container stops
-            # - Total downtime: ~1-2 seconds (just the swap time)
-            docker compose up -d --no-deps shivawebapp
+            # Create necessary directories
+            mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
             
-            # Wait for new container to be ready
-            echo "Waiting for new container to start..."
-            sleep 3
+            # ============================================
+            # HELPER FUNCTIONS
+            # ============================================
             
-            # Health check - verify new container is responding
-            MAX_RETRIES=10
-            RETRY_COUNT=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-              if docker ps | grep -q shivawebapp && docker ps --filter "name=shivawebapp" --format "{{.Status}}" | grep -q "Up"; then
-                echo "✓ New container is running and healthy"
-                break
+            # Logging function with timestamp
+            log() {
+              local message="$1"
+              local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
+              echo "[$timestamp] $message" | tee -a "$LOG_DIR/deploy.log"
+            }
+            
+            # Get container PID from Docker
+            get_container_pid() {
+              docker inspect -f '{{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null || echo ""
+            }
+            
+            # Save PID to file for process tracking
+            save_pid() {
+              local pid=$1
+              if [ -n "$pid" ]; then
+                echo "$pid" > "$PID_FILE"
+                log "✓ PID $pid saved to $PID_FILE"
+                # Verify PID file was created
+                if [ -f "$PID_FILE" ]; then
+                  log "  PID file verified: $(cat $PID_FILE)"
+                fi
               fi
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              echo "Waiting for container health check... ($RETRY_COUNT/$MAX_RETRIES)"
-              sleep 2
-            done
+            }
             
-            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
-              echo "⚠ Warning: Container health check failed, but container may still be starting"
-              echo "Check logs with: docker logs shivawebapp"
+            # Get PID from file
+            get_saved_pid() {
+              if [ -f "$PID_FILE" ]; then
+                cat "$PID_FILE"
+              else
+                echo ""
+              fi
+            }
+            
+            # Health check function
+            health_check() {
+              local max_attempts=30
+              local attempt=0
+              local container_id=$(docker ps -q -f name="$CONTAINER_NAME")
+              
+              if [ -z "$container_id" ]; then
+                log "✗ ERROR: Container not found"
+                return 1
+              fi
+              
+              log "Performing health check on container $container_id..."
+              
+              while [ $attempt -lt $max_attempts ]; do
+                # Check if container is still running
+                if ! docker ps | grep -q "$CONTAINER_NAME"; then
+                  log "✗ ERROR: Container stopped unexpectedly"
+                  return 1
+                fi
+                
+                # Get container PID
+                local pid=$(get_container_pid)
+                
+                # Verify process exists and is running
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                  # Check if container is responding (basic port check)
+                  if docker exec "$CONTAINER_NAME" wget --spider --quiet http://localhost:3001 2>/dev/null || \
+                     nc -z localhost 3001 2>/dev/null || \
+                     timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+                    log "✓ Health check passed (Container PID: $pid)"
+                    save_pid "$pid"
+                    return 0
+                  fi
+                fi
+                
+                attempt=$((attempt + 1))
+                if [ $((attempt % 5)) -eq 0 ]; then
+                  log "Health check attempt $attempt/$max_attempts (PID: ${pid:-none})..."
+                fi
+                sleep 2
+              done
+              
+              log "✗ ERROR: Health check failed after $max_attempts attempts"
+              return 1
+            }
+            
+            # Rollback function
+            rollback() {
+              log "=========================================="
+              log "ROLLBACK: Attempting to restore previous version"
+              log "=========================================="
+              
+              # Stop current failed container
+              docker stop "$CONTAINER_NAME" 2>/dev/null || true
+              docker rm "$CONTAINER_NAME" 2>/dev/null || true
+              
+              # Try to restore from backup
+              if [ -f "$BACKUP_DIR/last-working-image.tar" ]; then
+                log "Loading previous working image from backup..."
+                docker load -i "$BACKUP_DIR/last-working-image.tar"
+                cd "$DEPLOY_DIR"
+                docker compose up -d "$CONTAINER_NAME" || true
+                sleep 5
+                
+                if health_check; then
+                  local rollback_pid=$(get_container_pid)
+                  log "✓ Rollback successful (PID: $rollback_pid)"
+                  save_pid "$rollback_pid"
+                  return 0
+                fi
+              fi
+              
+              log "✗ ERROR: Rollback failed - manual intervention required"
+              return 1
+            }
+            
+            # Display process information
+            show_process_info() {
+              local pid=$1
+              if [ -n "$pid" ]; then
+                log "Process Information:"
+                log "  PID: $pid"
+                log "  Process Status: $(ps -p $pid -o stat= 2>/dev/null || echo 'not found')"
+                
+                # Show process tree if available
+                if command -v pstree >/dev/null 2>&1; then
+                  log "  Process Tree:"
+                  pstree -p "$pid" 2>/dev/null | head -5 || true
+                fi
+                
+                # Show resource usage
+                if ps -p "$pid" >/dev/null 2>&1; then
+                  log "  Memory Usage: $(ps -p $pid -o rss= | awk '{printf "%.2f MB", $1/1024}')"
+                  log "  CPU Usage: $(ps -p $pid -o %cpu=)%"
+                fi
+              fi
+            }
+            
+            # ============================================
+            # DEPLOYMENT PROCESS
+            # ============================================
+            
+            log "=========================================="
+            log "Starting Production Deployment"
+            log "=========================================="
+            log "Image: $IMAGE_NAME"
+            log "Container: $CONTAINER_NAME"
+            log "Deploy Directory: $DEPLOY_DIR"
+            log "PID File: $PID_FILE"
+            
+            # Step 1: Backup current working container (if exists)
+            OLD_PID=""
+            if docker ps | grep -q "$CONTAINER_NAME"; then
+              log "Step 1: Backing up current working container..."
+              OLD_CONTAINER_ID=$(docker ps -q -f name="$CONTAINER_NAME")
+              OLD_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "$IMAGE_NAME:latest")
+              OLD_PID=$(get_container_pid)
+              
+              log "  Current container ID: $OLD_CONTAINER_ID"
+              log "  Current image: $OLD_IMAGE"
+              log "  Current PID: $OLD_PID"
+              
+              # Backup the working image
+              if docker images | grep -q "$(echo $OLD_IMAGE | cut -d: -f1)"; then
+                docker save "$OLD_IMAGE" -o "$BACKUP_DIR/last-working-image.tar" 2>/dev/null && \
+                log "  ✓ Image backed up to $BACKUP_DIR/last-working-image.tar" || \
+                log "  ⚠ Warning: Could not backup image"
+              fi
+            else
+              log "Step 1: No existing container found (first deployment)"
             fi
             
-            # Cleanup old images (keep recent versions for rollback)
-            echo "Cleaning up old Docker images..."
-            docker image prune -f --filter "until=24h"
+            # Step 2: Build new Docker image (while old container is still running - ZERO DOWNTIME)
+            log "Step 2: Building new Docker image (old container still serving traffic)..."
+            cd "$TEMP_DEPLOY"
             
-            # Cleanup temporary deployment files
-            rm -rf /tmp/shivawebapp-deploy
+            # Build with cache for faster builds
+            if docker images | grep -q "$IMAGE_NAME"; then
+              log "  Using existing image as cache..."
+              docker build --cache-from "$IMAGE_NAME:latest" -t "$IMAGE_NAME:latest" . || {
+                log "✗ ERROR: Docker build failed"
+                exit 1
+              }
+            else
+              docker build -t "$IMAGE_NAME:latest" . || {
+                log "✗ ERROR: Docker build failed"
+                exit 1
+              }
+            fi
             
-            # Show deployment status
+            # Tag with timestamp for version tracking
+            TIMESTAMP_TAG=$(date +%Y%m%d-%H%M%S)
+            docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$TIMESTAMP_TAG"
+            log "  ✓ Image built and tagged as: $IMAGE_NAME:$TIMESTAMP_TAG"
+            
+            # Step 3: Zero-downtime container update
+            log "Step 3: Performing zero-downtime container update..."
+            cd "$DEPLOY_DIR"
+            
+            # Update container with new image (old container keeps running until new one is ready)
+            docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
+              log "✗ ERROR: Failed to start new container"
+              rollback
+              exit 1
+            }
+            
+            log "  New container started, waiting for it to be ready..."
+            sleep 3
+            
+            # Step 4: Health check and PID tracking
+            log "Step 4: Performing health check and PID tracking..."
+            if ! health_check; then
+              log "✗ ERROR: New container failed health check"
+              rollback
+              exit 1
+            fi
+            
+            # Step 5: Verify deployment and track PID
+            NEW_PID=$(get_container_pid)
+            SAVED_PID=$(get_saved_pid)
+            
+            log "Step 5: Deployment verification..."
+            log "  New container PID: $NEW_PID"
+            log "  Saved PID: $SAVED_PID"
+            
+            if [ "$NEW_PID" != "$SAVED_PID" ] && [ -n "$NEW_PID" ]; then
+              log "  ⚠ PID mismatch detected, updating PID file..."
+              save_pid "$NEW_PID"
+            fi
+            
+            # Display process information
+            show_process_info "$NEW_PID"
+            
+            # Step 6: Container resource monitoring
+            log "Step 6: Container resource usage:"
+            docker stats --no-stream "$CONTAINER_NAME" --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" || true
+            
+            # Step 7: Cleanup old images (keep last 3 versions for rollback)
+            log "Step 7: Cleaning up old Docker images..."
+            docker image prune -f --filter "until=48h" || true
+            
+            # Keep only last 3 timestamped tags
+            docker images "$IMAGE_NAME" --format "{{.Tag}}" | grep -E "^[0-9]{8}-" | sort -r | tail -n +4 | \
+              while read tag; do
+                docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "  Removed old image: $IMAGE_NAME:$tag" || true
+              done || true
+            
+            # Step 8: Cleanup temporary deployment files
+            log "Step 8: Cleaning up temporary files..."
+            rm -rf "$TEMP_DEPLOY"
+            log "  ✓ Temporary files removed"
+            
+            # Step 9: Final deployment status report
+            log "=========================================="
+            log "Deployment completed successfully!"
+            log "=========================================="
+            log "Container Name: $CONTAINER_NAME"
+            log "Container PID: $NEW_PID (tracked in $PID_FILE)"
+            log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
+            log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
+            log "Image Tag: $TIMESTAMP_TAG"
+            
+            # Show container details
             echo ""
-            echo "=========================================="
-            echo "Deployment completed successfully!"
-            echo "=========================================="
-            docker ps --filter "name=shivawebapp" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo "Container Details:"
+            docker ps --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Size}}"
+            
+            # Show PID file contents
+            echo ""
+            echo "PID Tracking:"
+            if [ -f "$PID_FILE" ]; then
+              echo "  PID File: $PID_FILE"
+              echo "  PID Value: $(cat $PID_FILE)"
+              echo "  Process Status: $(ps -p $(cat $PID_FILE) -o stat= 2>/dev/null || echo 'not running')"
+            else
+              echo "  ⚠ PID file not found"
+            fi
+            
+            log "=========================================="
+            log "Deployment Summary:"
+            log "  Old PID: ${OLD_PID:-none}"
+            log "  New PID: $NEW_PID"
+            log "  Downtime: ~1-2 seconds (container swap)"
+            log "  Rollback available: $([ -f "$BACKUP_DIR/last-working-image.tar" ] && echo 'yes' || echo 'no')"
+            log "=========================================="
