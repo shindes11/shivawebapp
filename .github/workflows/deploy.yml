@@ -43,9 +43,10 @@ jobs:
           username: ${{ secrets.AZURE_VM_USER }}
           password: ${{ secrets.AZURE_VM_PASSWORD }}
           port: 22
-          script_stop: true
+          script_stop: false
           script: |
-            set -euo pipefail
+            set -e
+            set -o pipefail || true
             
             # ============================================
             # PRODUCTION DEPLOYMENT SCRIPT
@@ -62,17 +63,38 @@ jobs:
             TEMP_DEPLOY="/tmp/shivawebapp-deploy"
             
             # Create necessary directories (user-writable locations in deploy directory)
-            mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
+            mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" || {
+              echo "ERROR: Failed to create directories. Using fallback locations."
+              BACKUP_DIR="$DEPLOY_DIR/backups"
+              LOG_DIR="$DEPLOY_DIR/logs"
+              PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
+              mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
+            }
+            
+            # Ensure log file exists and is writable
+            touch "$LOG_DIR/deploy.log" 2>/dev/null || {
+              LOG_DIR="$DEPLOY_DIR/logs"
+              mkdir -p "$LOG_DIR"
+              touch "$LOG_DIR/deploy.log"
+            }
             
             # ============================================
             # HELPER FUNCTIONS
             # ============================================
             
-            # Logging function with timestamp
+            # Logging function with timestamp (robust error handling)
             log() {
               local message="$1"
-              local timestamp=$(date +'%Y-%m-%d %H:%M:%S')
-              echo "[$timestamp] $message" | tee -a "$LOG_DIR/deploy.log"
+              local timestamp=$(date +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date 2>/dev/null || echo "N/A")
+              local log_msg="[$timestamp] $message"
+              
+              # Always output to stdout first
+              echo "$log_msg" || true
+              
+              # Try to append to log file, but don't fail if it doesn't work
+              if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
+                echo "$log_msg" >> "$LOG_DIR/deploy.log" 2>/dev/null || true
+              fi
             }
             
             # Get container PID from Docker
@@ -84,11 +106,17 @@ jobs:
             save_pid() {
               local pid=$1
               if [ -n "$pid" ]; then
-                echo "$pid" > "$PID_FILE"
+                echo "$pid" > "$PID_FILE" 2>/dev/null || {
+                  PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
+                  echo "$pid" > "$PID_FILE"
+                }
                 log "✓ PID $pid saved to $PID_FILE"
                 # Verify PID file was created
                 if [ -f "$PID_FILE" ]; then
-                  log "  PID file verified: $(cat $PID_FILE)"
+                  local saved_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+                  if [ -n "$saved_pid" ]; then
+                    log "  PID file verified: $saved_pid"
+                  fi
                 fi
               fi
             }
@@ -304,9 +332,9 @@ jobs:
             docker image prune -f --filter "until=48h" || true
             
             # Keep only last 3 timestamped tags
-            docker images "$IMAGE_NAME" --format "{{.Tag}}" | grep -E "^[0-9]{8}-" | sort -r | tail -n +4 | \
-              while read tag; do
-                docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "  Removed old image: $IMAGE_NAME:$tag" || true
+            docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -E "^[0-9]{8}-" 2>/dev/null | sort -r 2>/dev/null | tail -n +4 2>/dev/null | \
+              while IFS= read -r tag || [ -n "$tag" ]; do
+                [ -n "$tag" ] && docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "  Removed old image: $IMAGE_NAME:$tag" || true
               done || true
             
             # Step 8: Cleanup temporary deployment files
