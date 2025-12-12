@@ -132,12 +132,18 @@ jobs:
             
             # Health check function
             health_check() {
-              local max_attempts=30
+              local max_attempts=40
               local attempt=0
               local container_id=$(docker ps -q -f name="$CONTAINER_NAME")
               
               if [ -z "$container_id" ]; then
                 log "✗ ERROR: Container not found"
+                log "  Checking stopped containers..."
+                docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.ExitCode}}" || true
+                if docker ps -a | grep -q "$CONTAINER_NAME"; then
+                  log "  Container logs:"
+                  docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
+                fi
                 return 1
               fi
               
@@ -146,7 +152,11 @@ jobs:
               while [ $attempt -lt $max_attempts ]; do
                 # Check if container is still running
                 if ! docker ps | grep -q "$CONTAINER_NAME"; then
-                  log "✗ ERROR: Container stopped unexpectedly"
+                  log "✗ ERROR: Container stopped unexpectedly during health check"
+                  log "  Container status:"
+                  docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.ExitCode}}" || true
+                  log "  Container logs (last 50 lines):"
+                  docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
                   return 1
                 fi
                 
@@ -156,9 +166,22 @@ jobs:
                 # Verify process exists and is running
                 if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
                   # Check if container is responding (basic port check)
-                  if docker exec "$CONTAINER_NAME" wget --spider --quiet http://localhost:3001 2>/dev/null || \
-                     nc -z localhost 3001 2>/dev/null || \
-                     timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+                  # Try multiple methods for port checking
+                  local port_check=false
+                  
+                  # Method 1: Try docker exec with curl/wget
+                  if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001 || timeout 1 bash -c '</dev/tcp/localhost/3001' 2>/dev/null" 2>/dev/null; then
+                    port_check=true
+                  # Method 2: Try from host
+                  elif nc -z localhost 3001 2>/dev/null || timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+                    port_check=true
+                  # Method 3: Check if process is listening on port
+                  elif [ -n "$pid" ] && netstat -tlnp 2>/dev/null | grep -q ":3001.*$pid" || \
+                       ss -tlnp 2>/dev/null | grep -q ":3001.*pid=$pid"; then
+                    port_check=true
+                  fi
+                  
+                  if [ "$port_check" = true ]; then
                     log "✓ Health check passed (Container PID: $pid)"
                     save_pid "$pid"
                     return 0
@@ -167,12 +190,21 @@ jobs:
                 
                 attempt=$((attempt + 1))
                 if [ $((attempt % 5)) -eq 0 ]; then
-                  log "Health check attempt $attempt/$max_attempts (PID: ${pid:-none})..."
+                  log "Health check attempt $attempt/$max_attempts (PID: ${pid:-none}, Container: ${container_id:-none})..."
+                  # Show container logs every 10 attempts
+                  if [ $((attempt % 10)) -eq 0 ]; then
+                    log "  Recent container logs:"
+                    docker logs "$CONTAINER_NAME" --tail 10 2>&1 | head -5 || true
+                  fi
                 fi
-                sleep 2
+                sleep 3
               done
               
               log "✗ ERROR: Health check failed after $max_attempts attempts"
+              log "  Final container status:"
+              docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.ExitCode}}" || true
+              log "  Final container logs:"
+              docker logs "$CONTAINER_NAME" --tail 30 2>&1 || true
               return 1
             }
             
@@ -259,7 +291,12 @@ jobs:
                 log "  ⚠ Warning: Could not backup image"
               fi
             else
-              log "Step 1: No existing container found (first deployment)"
+              log "Step 1: No existing container found (first deployment or container stopped)"
+              # Check if there's a stopped container
+              if docker ps -a | grep -q "$CONTAINER_NAME"; then
+                log "  Found stopped container, removing it..."
+                docker rm "$CONTAINER_NAME" 2>/dev/null || true
+              fi
             fi
             
             # Step 2: Build new Docker image (while old container is still running - ZERO DOWNTIME)
@@ -289,20 +326,70 @@ jobs:
             log "Step 3: Performing zero-downtime container update..."
             cd "$DEPLOY_DIR"
             
+            # Verify docker-compose.yml exists
+            if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
+              log "⚠ WARNING: docker-compose.yml not found, creating basic one..."
+              cat > docker-compose.yml <<EOF
+version: '3.8'
+services:
+  $CONTAINER_NAME:
+    image: $IMAGE_NAME:latest
+    container_name: $CONTAINER_NAME
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - HOSTNAME=0.0.0.0
+EOF
+              log "  Created basic docker-compose.yml"
+            fi
+            
             # Update container with new image (old container keeps running until new one is ready)
-            docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
+            log "  Starting new container..."
+            if ! docker compose up -d --no-deps --pull never "$CONTAINER_NAME" 2>&1; then
               log "✗ ERROR: Failed to start new container"
+              log "  Checking if container exists..."
+              docker ps -a --filter name="$CONTAINER_NAME" || true
+              log "  Checking container logs for errors..."
+              docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
+              log "  Checking docker-compose configuration..."
+              docker compose config 2>&1 | head -20 || true
               rollback
               exit 1
-            }
+            fi
             
-            log "  New container started, waiting for it to be ready..."
-            sleep 3
+            log "  New container started, waiting for it to initialize..."
+            # Give container more time to start (Next.js needs time to boot)
+            sleep 5
+            
+            # Check if container is still running
+            if ! docker ps | grep -q "$CONTAINER_NAME"; then
+              log "✗ ERROR: Container stopped immediately after start"
+              log "  Checking container exit code and logs..."
+              docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.ExitCode}}" || true
+              log "  Last 100 lines of container logs:"
+              docker logs "$CONTAINER_NAME" --tail 100 2>&1 || true
+              rollback
+              exit 1
+            fi
+            
+            log "  Container is running, waiting additional time for application to be ready..."
+            sleep 10
             
             # Step 4: Health check and PID tracking
             log "Step 4: Performing health check and PID tracking..."
+            log "  Container status before health check:"
+            docker ps --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+            
             if ! health_check; then
               log "✗ ERROR: New container failed health check"
+              log "  Attempting to diagnose the issue..."
+              log "  Container details:"
+              docker inspect "$CONTAINER_NAME" 2>/dev/null | grep -A 10 '"State"' || true
+              log "  Full container logs:"
+              docker logs "$CONTAINER_NAME" 2>&1 | tail -100 || true
               rollback
               exit 1
             fi
