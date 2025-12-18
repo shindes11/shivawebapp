@@ -338,24 +338,44 @@ jobs:
             log "Step 2: Building new Docker image (old container still serving traffic)..."
             cd "$TEMP_DEPLOY"
             
-            # Build with cache for faster builds
+            # Extract version from package.json
+            APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "unknown")
+            APP_NAME=$(jq -r .name package.json 2>/dev/null || echo "$IMAGE_NAME")
+            GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
+            BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
+            
+            log "  Building image with version: $APP_VERSION"
+            log "  Git commit: $GIT_COMMIT"
+            log "  Build date: $BUILD_DATE"
+            
+            # Build with cache, labels, and version tag
+            BUILD_ARGS=""
             if docker images | grep -q "$IMAGE_NAME"; then
               log "  Using existing image as cache..."
-              docker build --cache-from "$IMAGE_NAME:latest" -t "$IMAGE_NAME:latest" . || {
-                log "✗ ERROR: Docker build failed"
-                exit 1
-              }
-            else
-              docker build -t "$IMAGE_NAME:latest" . || {
-                log "✗ ERROR: Docker build failed"
-                exit 1
-              }
+              BUILD_ARGS="--cache-from $IMAGE_NAME:latest"
             fi
+            
+            # Build image with labels and version tag
+            docker build \
+              --label="org.opencontainers.image.created=$BUILD_DATE" \
+              --label="org.opencontainers.image.title=$APP_NAME" \
+              --label="org.opencontainers.image.revision=$GIT_COMMIT" \
+              --label="org.opencontainers.image.version=$APP_VERSION" \
+              $BUILD_ARGS \
+              -t "$IMAGE_NAME:latest" \
+              -t "$IMAGE_NAME:$APP_VERSION" \
+              . || {
+                log "✗ ERROR: Docker build failed"
+                exit 1
+              }
             
             # Tag with timestamp for version tracking
             TIMESTAMP_TAG=$(date +%Y%m%d-%H%M%S)
             docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$TIMESTAMP_TAG"
-            log "  ✓ Image built and tagged as: $IMAGE_NAME:$TIMESTAMP_TAG"
+            log "  ✓ Image built and tagged as:"
+            log "    - $IMAGE_NAME:latest"
+            log "    - $IMAGE_NAME:$APP_VERSION"
+            log "    - $IMAGE_NAME:$TIMESTAMP_TAG"
             
             # Step 3: Zero-downtime container update
             log "Step 3: Performing zero-downtime container update..."
@@ -516,12 +536,12 @@ jobs:
             log "  Removing unused images older than 12 hours..."
             docker image prune -af --filter "until=12h" 2>/dev/null || true
             
-            # Final cleanup: Remove any other $IMAGE_NAME images that aren't 'latest'
-            log "  Final cleanup: Removing any other $IMAGE_NAME images (keeping only 'latest')..."
+            # Final cleanup: Remove any other $IMAGE_NAME images that aren't 'latest' or current version
+            log "  Final cleanup: Removing old $IMAGE_NAME images (keeping only 'latest' and current version)..."
             ALL_TAGS=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null || echo "")
             if [ -n "$ALL_TAGS" ]; then
               echo "$ALL_TAGS" | while IFS= read -r tag || [ -n "$tag" ]; do
-                if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+                if [ -n "$tag" ] && [ "$tag" != "latest" ] && [ "$tag" != "$APP_VERSION" ]; then
                   docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "    ✓ Removed: $IMAGE_NAME:$tag" || log "    ⚠ Skipped: $IMAGE_NAME:$tag (may be in use)"
                 fi
               done || true
@@ -530,7 +550,7 @@ jobs:
             # Count images after cleanup
             IMAGE_COUNT_AFTER=$(docker images "$IMAGE_NAME" --format "{{.ID}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
             log "  Images after cleanup: $IMAGE_COUNT_AFTER"
-            log "  ✓ Image cleanup completed (kept only: $IMAGE_NAME:latest)"
+            log "  ✓ Image cleanup completed (kept: $IMAGE_NAME:latest and $IMAGE_NAME:$APP_VERSION)"
             
             # Step 8: Cleanup temporary deployment files
             log "Step 8: Cleaning up temporary files..."
@@ -545,7 +565,9 @@ jobs:
             log "Container PID: $NEW_PID (tracked in $PID_FILE)"
             log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
             log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
-            log "Image Tag: $TIMESTAMP_TAG"
+            log "Image Version: $APP_VERSION"
+            log "Image Tags: latest, $APP_VERSION, $TIMESTAMP_TAG"
+            log "Git Commit: $GIT_COMMIT"
             
             # Show container details
             echo ""
