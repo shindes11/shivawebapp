@@ -217,21 +217,55 @@ jobs:
                 echo "    container_name: $CONTAINER_NAME"
                 echo "    restart: unless-stopped"
                 echo "    ports:"
-                echo "      - \"3001:3001\""
+                echo "      - \"0.0.0.0:3001:3001\""
                 echo "    environment:"
                 echo "      - NODE_ENV=development"
                 echo "      - PORT=3001"
                 echo "      - HOSTNAME=0.0.0.0"
+                echo "      - NEXT_PUBLIC_BASE_PATH="
+                echo "    network_mode: bridge"
               } > docker-compose.yml
+              log "  Created docker-compose.yml with proper port binding"
+            else
+              log "  Using existing docker-compose.yml"
+              # Ensure ports are properly configured
+              if ! grep -q "0.0.0.0:3001" docker-compose.yml 2>/dev/null; then
+                log "  ⚠ WARNING: Port binding might not be correct in existing docker-compose.yml"
+                log "  Please ensure ports are set to '0.0.0.0:3001:3001' for external access"
+              fi
             fi
             
             log "Starting container..."
             docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
               log "✗ ERROR: Failed to start container"
+              log "  Checking docker-compose status..."
+              docker compose ps 2>&1 || true
               exit 1
             }
             
+            log "  Container started, waiting for application to initialize..."
             sleep 10
+            
+            # Verify container is running and port is bound
+            log "  Verifying container and port configuration..."
+            CONTAINER_STATUS=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
+            PORT_BINDING=$(docker port "$CONTAINER_NAME" 2>/dev/null | grep 3001 || echo "")
+            
+            if [ -n "$CONTAINER_STATUS" ]; then
+              log "  ✓ Container is running: $CONTAINER_STATUS"
+            else
+              log "  ✗ Container is not running!"
+              docker logs "$CONTAINER_NAME" --tail 30 2>&1 || true
+              exit 1
+            fi
+            
+            if [ -n "$PORT_BINDING" ]; then
+              log "  ✓ Port binding: $PORT_BINDING"
+            else
+              log "  ⚠ WARNING: Port 3001 not bound correctly"
+              log "  Checking docker-compose configuration..."
+              docker compose config 2>&1 | grep -A 5 ports || true
+            fi
             
             if ! health_check; then
               log "✗ ERROR: Health check failed"
@@ -240,15 +274,56 @@ jobs:
             fi
             
             NEW_PID=$(get_container_pid)
+            
+            # Verify application is accessible
+            log "Verifying application accessibility..."
+            sleep 5
+            APP_ACCESSIBLE=false
+            for i in 1 2 3 4 5; do
+              if curl -f -s http://localhost:3001 > /dev/null 2>&1 || \
+                 curl -f -s http://127.0.0.1:3001 > /dev/null 2>&1; then
+                APP_ACCESSIBLE=true
+                log "  ✓ Application is responding on port 3001"
+                break
+              fi
+              log "  Waiting for application to be accessible... ($i/5)"
+              sleep 3
+            done
+            
+            if [ "$APP_ACCESSIBLE" = false ]; then
+              log "  ⚠ WARNING: Application might not be accessible yet"
+              log "  Container logs:"
+              docker logs "$CONTAINER_NAME" --tail 20 2>&1 || true
+            fi
+            
+            # Get server IP for access information
+            SERVER_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || \
+                       ip route get 8.8.8.8 | awk '{print $7; exit}' 2>/dev/null || \
+                       echo "unknown")
+            
             log "=========================================="
             log "Development Deployment Completed!"
             log "=========================================="
             log "Container PID: $NEW_PID"
             log "Image Version: $APP_VERSION"
             log "Git Commit: $GIT_COMMIT"
+            log "Server IP: $SERVER_IP"
+            log "Application URL: http://$SERVER_IP:3001"
+            log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
+            log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
             log "=========================================="
             log "✓ Development deployment successful!"
-            log "  Ready for production deployment approval"
+            log ""
+            log "Access your application at:"
+            log "  http://$SERVER_IP:3001"
+            log "  or"
+            log "  http://localhost:3001 (if accessing from server)"
+            log ""
+            log "If you cannot access the app:"
+            log "  1. Check GCP firewall rules allow port 3001"
+            log "  2. Verify container is running: docker ps"
+            log "  3. Check container logs: docker logs $CONTAINER_NAME"
+            log "  4. Verify port binding: docker port $CONTAINER_NAME"
             log "=========================================="
 
   # Production Deployment to Azure
