@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       environment:
@@ -13,25 +16,64 @@ on:
         options:
           - development
           - production
-      deploy_production:
-        description: 'Deploy to Production (after dev success)'
-        required: false
-        type: boolean
-        default: false
 
 env:
   IMAGE_NAME: shivawebapp
   CONTAINER_NAME: shivawebapp
+  NODE_VERSION: '18'
 
 jobs:
-  # Development/Staging Deployment to GCP
+  # ============================================
+  # BUILD & TEST JOB (Standard Practice)
+  # ============================================
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint -- --max-warnings 0 || true
+
+      - name: Type check
+        run: npx tsc --noEmit || true
+
+      - name: Build application
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: Check build artifacts
+        run: |
+          if [ ! -d ".next" ]; then
+            echo "❌ Build failed: .next directory not found"
+            exit 1
+          fi
+          echo "✅ Build successful"
+
+  # ============================================
+  # DEVELOPMENT DEPLOYMENT
+  # ============================================
   deploy-dev:
     name: Deploy to Development (GCP)
     runs-on: ubuntu-latest
     environment:
       name: development
+    needs: build-and-test
     if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'development')
     
     steps:
@@ -337,16 +379,17 @@ jobs:
             log "  4. Verify port binding: docker port $CONTAINER_NAME"
             log "=========================================="
 
-  # Production Deployment to Azure
+  # ============================================
+  # PRODUCTION DEPLOYMENT
+  # ============================================
   deploy-prod:
     name: Deploy to Production (Azure)
     runs-on: ubuntu-latest
     environment:
       name: production
-    # Production can be triggered manually after dev success, or directly via workflow_dispatch
+    # Production can be triggered manually after dev success
     if: |
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') ||
-      (github.event_name == 'workflow_dispatch' && (github.event.inputs.deploy_production == true || github.event.inputs.deploy_production == 'true'))
+      github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     needs: []
     
     steps:
