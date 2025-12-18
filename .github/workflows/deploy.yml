@@ -179,29 +179,40 @@ jobs:
             log "Starting Development Deployment"
             log "=========================================="
             
-            # Extract version from package.json
+            # Extract version from package.json (optional – used only for logging in dev)
             cd "$TEMP_DEPLOY"
             APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "unknown")
             APP_NAME=$(jq -r .name package.json 2>/dev/null || echo "$IMAGE_NAME")
             GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
             BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
             
-            log "Building image with version: $APP_VERSION"
+            log "Building development image (tag: latest, version: $APP_VERSION)"
             
-            # Build Docker image
+            # Build Docker image (only keep a single 'latest' tag in development)
             docker build \
               --label="org.opencontainers.image.created=$BUILD_DATE" \
               --label="org.opencontainers.image.title=$APP_NAME" \
               --label="org.opencontainers.image.revision=$GIT_COMMIT" \
               --label="org.opencontainers.image.version=$APP_VERSION" \
               -t "$IMAGE_NAME:latest" \
-              -t "$IMAGE_NAME:$APP_VERSION" \
               . || {
                 log "✗ ERROR: Docker build failed"
                 exit 1
               }
             
-            log "✓ Image built: $IMAGE_NAME:$APP_VERSION"
+            log "✓ Image built: $IMAGE_NAME:latest (version: $APP_VERSION)"
+
+            # Optional: clean up any old dev tags except 'latest'
+            if docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -q .; then
+              log "Cleaning up old development image tags for $IMAGE_NAME (keeping only 'latest')..."
+              docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | while read -r tag; do
+                if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+                  docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && \
+                    log "  ✓ Removed dev tag: $IMAGE_NAME:$tag" || \
+                    log "  ⚠ Skipped dev tag (in use or already gone): $IMAGE_NAME:$tag"
+                fi
+              done
+            fi
             
             # Deploy container
             cd "$DEPLOY_DIR"
