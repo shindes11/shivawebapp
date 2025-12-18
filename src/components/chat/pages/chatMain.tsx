@@ -10,7 +10,10 @@ import { useChat } from './useChat';
 
 
 export default function ChatMain({ token }: { token: string }) {
-  console.log('TokenA:', token); // Log the token for debugging
+  // Only log token in development and if it exists
+  if (process.env.NODE_ENV === 'development' && token) {
+    console.log('TokenA:', token);
+  }
   const { oldestTenantId, oldestUserId } = useMembership();
   const { messages, isLoading, sendMessage, messagesEndRef } = useChat(
     token,

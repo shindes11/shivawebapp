@@ -36,11 +36,14 @@ export function cookieSet(
     __session[key] = values[key];
   }
 
+  // In development, don't set secure flag (allows HTTP)
+  const isDevelopment = process.env.NODE_ENV === 'development';
+  
   responseCookies.set(COOKIE_NAME, JSON.stringify(__session), {
     httpOnly: true,
     path: '/',
     sameSite: 'lax',
-  
+    secure: !isDevelopment, // Only secure in production (HTTPS)
     expires: dayjs()
       .add(ms('7 days'), 'milliseconds')
       .toDate(),

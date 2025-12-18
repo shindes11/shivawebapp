@@ -10,7 +10,10 @@ export function useChat(token: string, oldestTenantId: string | null, oldestUser
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  console.log('TokenB:', token); // Log the token for debugging
+  // Only log token in development and if it exists
+  if (process.env.NODE_ENV === 'development' && token) {
+    console.log('TokenB:', token);
+  }
 
   useEffect(() => {
     if (messagesEndRef.current) {
