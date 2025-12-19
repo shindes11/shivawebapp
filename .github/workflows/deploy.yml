@@ -239,11 +239,11 @@ jobs:
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    # When manually triggered: work independently, use existing image from dev
-    # When auto-triggered: depends on deploy-dev success
-    needs: 
-      - ci
-      - deploy-dev
+    # Production deployment:
+    # - Manual trigger: Independent, uses existing image from dev (no rebuild/test)
+    # - Auto trigger: Depends on deploy-dev success
+    # Note: When manually triggered, version comes from package.json
+    #       The image should already exist in registry from previous dev deployment
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') ||
       (github.event_name == 'push' && needs.deploy-dev.result == 'success')
@@ -253,15 +253,16 @@ jobs:
     steps:
       - name: Checkout code (to get version)
         uses: actions/checkout@v4
-        if: github.event_name == 'workflow_dispatch'
       
       - name: Get version from package.json
         id: version
-        if: github.event_name == 'workflow_dispatch'
         run: |
           VERSION=$(jq -r .version package.json)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Using version: $VERSION (image already built and tested in dev)"
+          echo "Using version: $VERSION"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger: Using existing image from dev (no rebuild/test)"
+          fi
       
       - name: Deploy to Production Server
         uses: appleboy/ssh-action@v1.0.3
@@ -278,13 +279,21 @@ jobs:
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
             
-            # Get version: from deploy-dev output (if available) or from step output (manual)
-            VERSION="${{ needs.deploy-dev.outputs.version || steps.version.outputs.version }}"
+            # Get version: prefer deploy-dev output if available, otherwise use from package.json
+            if [ -n "${{ needs.deploy-dev.outputs.version }}" ] && [ "${{ needs.deploy-dev.outputs.version }}" != "null" ]; then
+              VERSION="${{ needs.deploy-dev.outputs.version }}"
+            else
+              VERSION="${{ steps.version.outputs.version }}"
+            fi
             
             if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
               echo "✗ ERROR: Could not determine version"
-              echo "Make sure dev deployment succeeded first, or version exists in package.json"
               exit 1
+            fi
+            
+            echo "Deploying image: ${IMAGE_NAME}:${VERSION}"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "Manual trigger: Using existing image that was successfully deployed to dev"
             fi
             
             echo "Deploying image: ${IMAGE_NAME}:${VERSION}"
