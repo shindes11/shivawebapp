@@ -118,6 +118,9 @@ jobs:
     needs: ci
     environment:
       name: development
+    outputs:
+      version: ${{ needs.ci.outputs.version }}
+      image-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'development')
@@ -223,10 +226,16 @@ jobs:
   # ============================================
   # CD: Deploy to Production
   # ============================================
+  # Production deployment:
+  # - Only runs AFTER development deployment succeeds (needs: deploy-dev)
+  # - Uses the SAME image that was successfully deployed to dev
+  # - No rebuild or tests needed - reuses proven image
+  # - Manual trigger only via workflow_dispatch
+  # ============================================
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: ci
+    needs: deploy-dev
     environment:
       name: production
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
@@ -243,10 +252,10 @@ jobs:
             set -e
             
             REGISTRY="${{ env.REGISTRY }}"
-            IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+            IMAGE_NAME="${{ needs.deploy-dev.outputs.image-name }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
-            VERSION="${{ needs.ci.outputs.version }}"
+            VERSION="${{ needs.deploy-dev.outputs.version }}"
             
             # Login to registry (requires GHCR_TOKEN secret)
             echo "${{ secrets.GHCR_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
