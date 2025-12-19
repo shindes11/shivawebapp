@@ -64,7 +64,11 @@ jobs:
           NEXT_TELEMETRY_DISABLED: 1
 
       - name: Verify build
-        run: test -d .next || (echo "Build failed: .next directory not found" && exit 1)
+        run: |
+          if [ ! -d .next ]; then
+            echo "Build failed: .next directory not found"
+            exit 1
+          fi
 
       - name: Extract version
         id: version
@@ -189,7 +193,7 @@ jobs:
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
-          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
           port: 22
           script: |
             set -e
