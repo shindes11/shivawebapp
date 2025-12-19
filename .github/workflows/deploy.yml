@@ -244,8 +244,7 @@ jobs:
     # - Auto trigger: Depends on deploy-dev success
     # Note: Version comes from package.json (image already exists in registry from dev)
     if: |
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') ||
-      (github.event_name == 'push' && needs.deploy-dev.result == 'success')
+      github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     environment:
       name: production
     
