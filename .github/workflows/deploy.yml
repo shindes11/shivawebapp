@@ -1,4 +1,4 @@
-name: CI/CD Pipeline (Development & Production)
+name: CI/CD Pipeline
 
 on:
   push:
@@ -23,9 +23,6 @@ env:
   NODE_VERSION: '18'
 
 jobs:
-  # ============================================
-  # BUILD & TEST JOB (Standard Practice)
-  # ============================================
   build-and-test:
     name: Build and Test
     runs-on: ubuntu-latest
@@ -55,19 +52,11 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
-      - name: Check build artifacts
-        run: |
-          if [ ! -d ".next" ]; then
-            echo "❌ Build failed: .next directory not found"
-            exit 1
-          fi
-          echo "✅ Build successful"
+      - name: Verify build
+        run: test -d .next || (echo "Build failed: .next directory not found" && exit 1)
 
-  # ============================================
-  # DEVELOPMENT DEPLOYMENT
-  # ============================================
   deploy-dev:
-    name: Deploy to Development (GCP)
+    name: Deploy to Development
     runs-on: ubuntu-latest
     environment:
       name: development
@@ -80,7 +69,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy files to GCP development server
+      - name: Copy files to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.GCP_DEV_HOST }}
@@ -92,7 +81,7 @@ jobs:
           target: "/tmp/shivawebapp-deploy"
           strip_components: 0
 
-      - name: Development Deployment with PID Tracking & Zero-Downtime
+      - name: Deploy to Development
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.GCP_DEV_HOST }}
@@ -100,376 +89,96 @@ jobs:
           key: ${{ secrets.GCP_DEV_SSH_KEY }}
           passphrase: ${{ secrets.GCP_DEV_PASSPHRASE }}
           port: 22
-          script_stop: false
           script: |
             set -e
-            set -o pipefail || true
             
-            # ============================================
-            # DEVELOPMENT DEPLOYMENT SCRIPT
-            # Features: Zero-downtime, PID tracking, Health checks, Rollback
-            # ============================================
-            
-            # Configuration for Development
             IMAGE_NAME="${{ env.IMAGE_NAME }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="${{ secrets.GCP_DEV_DEPLOY_DIR || '/home/$(whoami)/shivawebapp' }}"
-            PID_FILE="$DEPLOY_DIR/.shivawebapp/shivawebapp.pid"
-            BACKUP_DIR="$DEPLOY_DIR/.shivawebapp/backups"
-            LOG_DIR="$DEPLOY_DIR/.shivawebapp/logs"
             TEMP_DEPLOY="/tmp/shivawebapp-deploy"
             
-            # Create necessary directories
-            mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" || {
-              echo "ERROR: Failed to create directories. Using fallback locations."
-              BACKUP_DIR="$DEPLOY_DIR/backups"
-              LOG_DIR="$DEPLOY_DIR/logs"
-              PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
-              mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
-            }
-            
-            touch "$LOG_DIR/deploy.log" 2>/dev/null || {
-              LOG_DIR="$DEPLOY_DIR/logs"
-              mkdir -p "$LOG_DIR"
-              touch "$LOG_DIR/deploy.log"
-            }
-            
-            # ============================================
-            # HELPER FUNCTIONS
-            # ============================================
-            
-            log() {
-              local message="$1"
-              local timestamp=$(date +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date 2>/dev/null || echo "N/A")
-              local log_msg="[DEV][$timestamp] $message"
-              echo "$log_msg" || true
-              if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
-                echo "$log_msg" >> "$LOG_DIR/deploy.log" 2>/dev/null || true
-              fi
-            }
-            
-            get_container_pid() {
-              docker inspect -f '{{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null || echo ""
-            }
-            
-            save_pid() {
-              local pid=$1
-              if [ -n "$pid" ]; then
-                echo "$pid" > "$PID_FILE" 2>/dev/null || {
-                  PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
-                  echo "$pid" > "$PID_FILE"
-                }
-                log "✓ PID $pid saved to $PID_FILE"
-              fi
-            }
-            
-            health_check() {
-              local max_attempts=30
-              local attempt=0
-              local container_id=$(docker ps -q -f name="$CONTAINER_NAME")
-              
-              if [ -z "$container_id" ]; then
-                log "✗ ERROR: Container not found"
-                return 1
-              fi
-              
-              log "Performing health check on container $container_id..."
-              
-              while [ $attempt -lt $max_attempts ]; do
-                local current_status=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-                if [ -z "$current_status" ]; then
-                  local stopped_status=$(docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-                  if [ -n "$stopped_status" ]; then
-                    log "✗ ERROR: Container stopped unexpectedly"
-                    return 1
-                  fi
-                fi
-                
-                local pid=$(get_container_pid)
-                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                  if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001 2>/dev/null || (timeout 1 bash -c '</dev/tcp/localhost/3001' 2>/dev/null && exit 0 || exit 1)" 2>/dev/null || \
-                     nc -z localhost 3001 2>/dev/null || \
-                     timeout 3 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
-                    log "✓ Health check passed (Container PID: $pid)"
-                    save_pid "$pid"
-                    return 0
-                  fi
-                fi
-                
-                attempt=$((attempt + 1))
-                if [ $((attempt % 5)) -eq 0 ]; then
-                  log "Health check attempt $attempt/$max_attempts (PID: ${pid:-none})..."
-                fi
-                sleep 3
-              done
-              
-              log "✗ ERROR: Health check failed after $max_attempts attempts"
-              local final_pid=$(get_container_pid)
-              if [ -n "$final_pid" ] && kill -0 "$final_pid" 2>/dev/null && docker ps | grep -q "$CONTAINER_NAME"; then
-                log "⚠ WARNING: Health check failed but container is running (PID: $final_pid)"
-                save_pid "$final_pid"
-                return 0
-              fi
-              return 1
-            }
-            
-            # ============================================
-            # DEPLOYMENT PROCESS
-            # ============================================
-            
-            log "=========================================="
-            log "Starting Development Deployment"
-            log "=========================================="
-            
-            # Extract version from package.json (robust extraction with fallback)
+            # Extract version from package.json
             cd "$TEMP_DEPLOY"
-            if command -v jq >/dev/null 2>&1; then
-              APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "")
-            else
-              APP_VERSION=$(grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "")
-            fi
+            APP_VERSION=$(jq -r .version package.json 2>/dev/null || grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "dev")
             
-            # Fallback: try to extract version using sed if above methods fail
-            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
-              APP_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "")
-            fi
+            echo "Building image: $IMAGE_NAME:$APP_VERSION"
             
-            # If still no version, use 'dev' as fallback for development
-            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
-              APP_VERSION="dev"
-              log "⚠ WARNING: Could not extract version from package.json, using 'dev' tag"
-            fi
-            
-            APP_NAME=$(jq -r .name package.json 2>/dev/null || grep -oP '"name"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "$IMAGE_NAME")
-            GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
-            BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
-            
-            log "Building development image (tag: $APP_VERSION)"
-            
-            # Build Docker image with version tag
+            # Build Docker image
             docker build \
-              --label="org.opencontainers.image.created=$BUILD_DATE" \
-              --label="org.opencontainers.image.title=$APP_NAME" \
-              --label="org.opencontainers.image.revision=$GIT_COMMIT" \
               --label="org.opencontainers.image.version=$APP_VERSION" \
+              --label="org.opencontainers.image.revision=$(git log -1 --format=%h 2>/dev/null || echo 'unknown')" \
               -t "$IMAGE_NAME:$APP_VERSION" \
-              . || {
-                log "✗ ERROR: Docker build failed"
-                exit 1
-              }
+              . || exit 1
             
-            log "✓ Image built: $IMAGE_NAME:$APP_VERSION"
-            
-            # Deploy container
+            # Setup docker-compose
             cd "$DEPLOY_DIR"
-            
-            # Create docker-compose.yml if not exists
-            if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
-              log "Creating docker-compose.yml..."
-              {
-                echo "version: '3.8'"
-                echo "services:"
-                echo "  $CONTAINER_NAME:"
-                echo "    image: $IMAGE_NAME:$APP_VERSION"
-                echo "    container_name: $CONTAINER_NAME"
-                echo "    restart: unless-stopped"
-                echo "    ports:"
-                echo "      - \"0.0.0.0:3001:3001\""
-                echo "    environment:"
-                echo "      - NODE_ENV=development"
-                echo "      - PORT=3001"
-                echo "      - HOSTNAME=0.0.0.0"
-                echo "      - NEXT_PUBLIC_BASE_PATH="
-                echo "    network_mode: bridge"
-              } > docker-compose.yml
-              log "  Created docker-compose.yml with version tag: $APP_VERSION"
+            if [ ! -f "docker-compose.yml" ]; then
+              cat > docker-compose.yml <<EOF
+            version: '3.8'
+            services:
+              $CONTAINER_NAME:
+                image: $IMAGE_NAME:$APP_VERSION
+                container_name: $CONTAINER_NAME
+                restart: unless-stopped
+                ports:
+                  - "0.0.0.0:3001:3001"
+                environment:
+                  - NODE_ENV=development
+                  - PORT=3001
+                  - HOSTNAME=0.0.0.0
+            EOF
             else
-              log "  Using existing docker-compose.yml"
-              # Update to use version tag if it's using latest
-              if grep -q "image: $IMAGE_NAME:latest" docker-compose.yml 2>/dev/null; then
-                log "  Updating docker-compose.yml to use version tag: $APP_VERSION"
-                sed -i "s|image: $IMAGE_NAME:latest|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
-              fi
-              # Ensure ports are properly configured
-              if ! grep -q "0.0.0.0:3001" docker-compose.yml 2>/dev/null; then
-                log "  ⚠ WARNING: Port binding might not be correct in existing docker-compose.yml"
-                log "  Please ensure ports are set to '0.0.0.0:3001:3001' for external access"
-              fi
+              sed -i "s|image: $IMAGE_NAME:.*|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
             fi
             
-            # Remove old container if it exists (to ensure clean deployment)
-            # This must happen BEFORE cleanup so old images are no longer in use
-            if docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
-              log "Removing old container before creating new one..."
-              docker stop "$CONTAINER_NAME" 2>/dev/null || true
-              docker rm "$CONTAINER_NAME" 2>/dev/null || true
-              log "  ✓ Old container removed"
-            fi
+            # Remove old container
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
             
-            # Clean up old development images and dangling images (AFTER container removal)
-            log "Cleaning up old development images..."
-            
-            # Get current image ID to avoid removing it
-            CURRENT_IMAGE_ID=$(docker images "$IMAGE_NAME:$APP_VERSION" --format "{{.ID}}" 2>/dev/null || echo "")
-            
-            # Remove all old tags except current version (more robust method)
-            docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | while IFS= read -r image_tag || [ -n "$image_tag" ]; do
-              if [ -n "$image_tag" ]; then
-                tag=$(echo "$image_tag" | cut -d: -f2)
-                image_id=$(docker images "$image_tag" --format "{{.ID}}" 2>/dev/null || echo "")
-                
-                # Skip if it's the current version tag or same image ID
-                if [ "$tag" != "$APP_VERSION" ] && [ "$image_id" != "$CURRENT_IMAGE_ID" ]; then
-                  # Force remove if not in use
-                  if docker rmi "$image_tag" 2>/dev/null; then
-                    log "  ✓ Removed old image: $image_tag"
-                  else
-                    # Try to remove by ID if tag removal fails
-                    if [ -n "$image_id" ] && [ "$image_id" != "$CURRENT_IMAGE_ID" ]; then
-                      docker rmi "$image_id" 2>/dev/null && log "  ✓ Removed old image by ID: $image_id" || log "  ⚠ Could not remove: $image_tag (may be in use)"
-                    else
-                      log "  ⚠ Skipped: $image_tag (may be in use or same as current)"
-                    fi
-                  fi
-                fi
+            # Clean up old images
+            CURRENT_ID=$(docker images "$IMAGE_NAME:$APP_VERSION" --format "{{.ID}}" 2>/dev/null || echo "")
+            docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | while read -r img; do
+              [ -z "$img" ] && continue
+              tag=$(echo "$img" | cut -d: -f2)
+              img_id=$(docker images "$img" --format "{{.ID}}" 2>/dev/null || echo "")
+              if [ "$tag" != "$APP_VERSION" ] && [ "$img_id" != "$CURRENT_ID" ]; then
+                docker rmi "$img" 2>/dev/null || true
               fi
             done || true
             
-            # Specifically remove 'latest' tag if it exists and is different from current version
-            if docker images "$IMAGE_NAME:latest" --format "{{.ID}}" 2>/dev/null | grep -q .; then
-              LATEST_IMAGE_ID=$(docker images "$IMAGE_NAME:latest" --format "{{.ID}}" 2>/dev/null || echo "")
-              if [ -n "$LATEST_IMAGE_ID" ] && [ "$LATEST_IMAGE_ID" != "$CURRENT_IMAGE_ID" ]; then
-                if docker rmi "$IMAGE_NAME:latest" 2>/dev/null; then
-                  log "  ✓ Removed old 'latest' tag"
-                else
-                  # Try removing by ID
-                  docker rmi "$LATEST_IMAGE_ID" 2>/dev/null && log "  ✓ Removed old 'latest' image by ID" || log "  ⚠ Could not remove 'latest' tag (may be in use)"
-                fi
+            # Remove dangling images
+            docker image prune -f 2>/dev/null || true
+            
+            # Start container
+            docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || exit 1
+            
+            # Health check
+            echo "Waiting for container to be ready..."
+            for i in {1..30}; do
+              if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001" 2>/dev/null || \
+                 timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+                echo "✓ Container is healthy"
+                exit 0
               fi
-            fi
-            
-            # Remove dangling images (<none> tags)
-            DANGLING_COUNT=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            if [ "$DANGLING_COUNT" -gt 0 ]; then
-              docker image prune -f 2>/dev/null && log "  ✓ Removed $DANGLING_COUNT dangling images" || true
-            fi
-            
-            # Clean up unused images older than 12 hours
-            docker image prune -af --filter "until=12h" 2>/dev/null || true
-            
-            # Final verification
-            REMAINING_IMAGES=$(docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            log "  ✓ Cleanup completed. Remaining $IMAGE_NAME images: $REMAINING_IMAGES"
-            
-            log "Starting new container..."
-            docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
-              log "✗ ERROR: Failed to start container"
-              log "  Checking docker-compose status..."
-              docker compose ps 2>&1 || true
-              exit 1
-            }
-            
-            log "  Container started, waiting for application to initialize..."
-            sleep 10
-            
-            # Verify container is running and port is bound
-            log "  Verifying container and port configuration..."
-            CONTAINER_STATUS=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-            PORT_BINDING=$(docker port "$CONTAINER_NAME" 2>/dev/null | grep 3001 || echo "")
-            
-            if [ -n "$CONTAINER_STATUS" ]; then
-              log "  ✓ Container is running: $CONTAINER_STATUS"
-            else
-              log "  ✗ Container is not running!"
-              docker logs "$CONTAINER_NAME" --tail 30 2>&1 || true
-              exit 1
-            fi
-            
-            if [ -n "$PORT_BINDING" ]; then
-              log "  ✓ Port binding: $PORT_BINDING"
-            else
-              log "  ⚠ WARNING: Port 3001 not bound correctly"
-              log "  Checking docker-compose configuration..."
-              docker compose config 2>&1 | grep -A 5 ports || true
-            fi
-            
-            if ! health_check; then
-              log "✗ ERROR: Health check failed"
-              docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
-              exit 1
-            fi
-            
-            NEW_PID=$(get_container_pid)
-            
-            # Verify application is accessible
-            log "Verifying application accessibility..."
-            sleep 5
-            APP_ACCESSIBLE=false
-            for i in 1 2 3 4 5; do
-              if curl -f -s http://localhost:3001 > /dev/null 2>&1 || \
-                 curl -f -s http://127.0.0.1:3001 > /dev/null 2>&1; then
-                APP_ACCESSIBLE=true
-                log "  ✓ Application is responding on port 3001"
-                break
-              fi
-              log "  Waiting for application to be accessible... ($i/5)"
-              sleep 3
+              sleep 2
             done
             
-            if [ "$APP_ACCESSIBLE" = false ]; then
-              log "  ⚠ WARNING: Application might not be accessible yet"
-              log "  Container logs:"
-              docker logs "$CONTAINER_NAME" --tail 20 2>&1 || true
-            fi
-            
-            # Get server IP for access information
-            SERVER_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || \
-                       ip route get 8.8.8.8 | awk '{print $7; exit}' 2>/dev/null || \
-                       echo "unknown")
-            
-            log "=========================================="
-            log "Development Deployment Completed!"
-            log "=========================================="
-            log "Container PID: $NEW_PID"
-            log "Image Version: $APP_VERSION"
-            log "Git Commit: $GIT_COMMIT"
-            log "Server IP: $SERVER_IP"
-            log "Application URL: http://$SERVER_IP:3001"
-            log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
-            log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
-            log "=========================================="
-            log "✓ Development deployment successful!"
-            log ""
-            log "Access your application at:"
-            log "  http://$SERVER_IP:3001"
-            log "  or"
-            log "  http://localhost:3001 (if accessing from server)"
-            log ""
-            log "If you cannot access the app:"
-            log "  1. Check GCP firewall rules allow port 3001"
-            log "  2. Verify container is running: docker ps"
-            log "  3. Check container logs: docker logs $CONTAINER_NAME"
-            log "  4. Verify port binding: docker port $CONTAINER_NAME"
-            log "=========================================="
+            echo "✗ Health check failed"
+            docker logs "$CONTAINER_NAME" --tail 50
+            exit 1
 
-  # ============================================
-  # PRODUCTION DEPLOYMENT
-  # ============================================
   deploy-prod:
-    name: Deploy to Production (Azure)
+    name: Deploy to Production
     runs-on: ubuntu-latest
     environment:
       name: production
-    # Production can be triggered manually after dev success
-    if: |
-      github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
-    needs: []
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy files to Azure production server
+      - name: Copy files to server
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
@@ -480,510 +189,117 @@ jobs:
           target: "/tmp/shivawebapp-deploy"
           strip_components: 0
 
-      - name: Production Deployment with PID Tracking & Zero-Downtime
+      - name: Deploy to Production
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.AZURE_VM_HOST }}
           username: ${{ secrets.AZURE_VM_USER }}
           password: ${{ secrets.AZURE_VM_PASSWORD }}
           port: 22
-          script_stop: false
           script: |
             set -e
-            set -o pipefail || true
             
-            # ============================================
-            # PRODUCTION DEPLOYMENT SCRIPT
-            # Features: Zero-downtime, PID tracking, Health checks, Rollback
-            # ============================================
-            
-            # Configuration
             IMAGE_NAME="${{ env.IMAGE_NAME }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
-            PID_FILE="$DEPLOY_DIR/.shivawebapp/shivawebapp.pid"
-            BACKUP_DIR="$DEPLOY_DIR/.shivawebapp/backups"
-            LOG_DIR="$DEPLOY_DIR/.shivawebapp/logs"
             TEMP_DEPLOY="/tmp/shivawebapp-deploy"
+            BACKUP_DIR="$DEPLOY_DIR/.shivawebapp/backups"
             
-            # Create necessary directories (user-writable locations in deploy directory)
-            mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")" || {
-              echo "ERROR: Failed to create directories. Using fallback locations."
-              BACKUP_DIR="$DEPLOY_DIR/backups"
-              LOG_DIR="$DEPLOY_DIR/logs"
-              PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
-              mkdir -p "$BACKUP_DIR" "$LOG_DIR" "$(dirname "$PID_FILE")"
-            }
+            mkdir -p "$BACKUP_DIR"
             
-            # Ensure log file exists and is writable
-            touch "$LOG_DIR/deploy.log" 2>/dev/null || {
-              LOG_DIR="$DEPLOY_DIR/logs"
-              mkdir -p "$LOG_DIR"
-              touch "$LOG_DIR/deploy.log"
-            }
-            
-            # ============================================
-            # HELPER FUNCTIONS
-            # ============================================
-            
-            # Logging function with timestamp (robust error handling)
-            log() {
-              local message="$1"
-              local timestamp=$(date +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date 2>/dev/null || echo "N/A")
-              local log_msg="[PROD][$timestamp] $message"
-              
-              # Always output to stdout
-              echo "$log_msg" || true
-              
-              # Try to append to log file, but don't fail if it doesn't work
-              if [ -d "$LOG_DIR" ] && [ -w "$LOG_DIR" ]; then
-                echo "$log_msg" >> "$LOG_DIR/deploy.log" 2>/dev/null || true
-              fi
-            }
-            
-            # Get container PID from Docker
-            get_container_pid() {
-              docker inspect -f '{{.State.Pid}}' "$CONTAINER_NAME" 2>/dev/null || echo ""
-            }
-            
-            # Save PID to file for process tracking
-            save_pid() {
-              local pid=$1
-              if [ -n "$pid" ]; then
-                echo "$pid" > "$PID_FILE" 2>/dev/null || {
-                  PID_FILE="$DEPLOY_DIR/shivawebapp.pid"
-                  echo "$pid" > "$PID_FILE"
-                }
-                log "✓ PID $pid saved to $PID_FILE"
-                local saved_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-                if [ -n "$saved_pid" ]; then
-                  log "  PID file verified: $saved_pid"
-                fi
-              fi
-            }
-            
-            # Get PID from file
-            get_saved_pid() {
-              if [ -f "$PID_FILE" ]; then
-                cat "$PID_FILE"
-              else
-                echo ""
-              fi
-            }
-            
-            # Health check function
-            health_check() {
-              local max_attempts=40
-              local attempt=0
-              local container_id=$(docker ps -q -f name="$CONTAINER_NAME")
-              
-              if [ -z "$container_id" ]; then
-                log "✗ ERROR: Container not found in running containers"
-                log "  Checking all containers (including stopped)..."
-                docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}" || true
-                if docker ps -a | grep -q "$CONTAINER_NAME"; then
-                  log "  Container logs:"
-                  docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
-                fi
-                return 1
-              fi
-              
-              log "Performing health check on container $container_id..."
-              
-              while [ $attempt -lt $max_attempts ]; do
-                local current_status=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-                if [ -z "$current_status" ]; then
-                  local stopped_status=$(docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-                  if [ -n "$stopped_status" ]; then
-                    log "✗ ERROR: Container stopped unexpectedly during health check"
-                    log "  Container status: $stopped_status"
-                    log "  Container logs (last 50 lines):"
-                    docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
-                    return 1
-                  else
-                    log "⚠ WARNING: Could not verify container status, but continuing health check..."
-                  fi
-                fi
-                
-                local pid=$(get_container_pid)
-                
-                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                  if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001 2>/dev/null || (timeout 1 bash -c '</dev/tcp/localhost/3001' 2>/dev/null && exit 0 || exit 1)" 2>/dev/null || \
-                     nc -z localhost 3001 2>/dev/null || \
-                     timeout 3 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
-                    log "✓ Health check passed (Container PID: $pid)"
-                    save_pid "$pid"
-                    return 0
-                  fi
-                elif [ -z "$pid" ] && [ $attempt -gt 5 ]; then
-                  log "  Warning: Could not get PID, checking container logs..."
-                  docker logs "$CONTAINER_NAME" --tail 5 2>&1 | head -3 || true
-                fi
-                
-                attempt=$((attempt + 1))
-                if [ $((attempt % 5)) -eq 0 ]; then
-                  log "Health check attempt $attempt/$max_attempts (PID: ${pid:-none}, Container: ${container_id:-none})..."
-                  if [ $((attempt % 10)) -eq 0 ]; then
-                    log "  Recent container logs:"
-                    docker logs "$CONTAINER_NAME" --tail 10 2>&1 | head -5 || true
-                  fi
-                fi
-                sleep 3
-              done
-              
-              log "✗ ERROR: Health check failed after $max_attempts attempts"
-              log "  Final container status:"
-              docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}" || true
-              log "  Final container logs:"
-              docker logs "$CONTAINER_NAME" --tail 30 2>&1 || true
-              
-              local final_pid=$(get_container_pid)
-              if [ -n "$final_pid" ] && kill -0 "$final_pid" 2>/dev/null && docker ps | grep -q "$CONTAINER_NAME"; then
-                log "⚠ WARNING: Health check failed but container and process are running"
-                log "  Accepting deployment as container appears to be running (PID: $final_pid)"
-                save_pid "$final_pid"
-                return 0
-              fi
-              
-              return 1
-            }
-            
-            # Rollback function
-            rollback() {
-              log "=========================================="
-              log "ROLLBACK: Attempting to restore previous version"
-              log "=========================================="
-              
-              docker stop "$CONTAINER_NAME" 2>/dev/null || true
-              docker rm "$CONTAINER_NAME" 2>/dev/null || true
-              
-              if [ -f "$BACKUP_DIR/last-working-image.tar" ]; then
-                log "Loading previous working image from backup..."
-                docker load -i "$BACKUP_DIR/last-working-image.tar"
-                cd "$DEPLOY_DIR"
-                docker compose up -d "$CONTAINER_NAME" || true
-                sleep 5
-                
-                if health_check; then
-                  local rollback_pid=$(get_container_pid)
-                  log "✓ Rollback successful (PID: $rollback_pid)"
-                  save_pid "$rollback_pid"
-                  return 0
-                fi
-              fi
-              
-              log "✗ ERROR: Rollback failed - manual intervention required"
-              return 1
-            }
-            
-            show_process_info() {
-              local pid=$1
-              if [ -n "$pid" ]; then
-                log "Process Information:"
-                log "  PID: $pid"
-                log "  Process Status: $(ps -p $pid -o stat= 2>/dev/null || echo 'not found')"
-                if command -v pstree >/dev/null 2>&1; then
-                  log "  Process Tree:"
-                  pstree -p "$pid" 2>/dev/null | head -5 || true
-                fi
-                if ps -p "$pid" >/dev/null 2>&1; then
-                  log "  Memory Usage: $(ps -p $pid -o rss= | awk '{printf "%.2f MB", $1/1024}')"
-                  log "  CPU Usage: $(ps -p $pid -o %cpu=)%"
-                fi
-              fi
-            }
-            
-            # ============================================
-            # DEPLOYMENT PROCESS
-            # ============================================
-            
-            log "=========================================="
-            log "Starting Production Deployment"
-            log "=========================================="
-            log "Image: $IMAGE_NAME"
-            log "Container: $CONTAINER_NAME"
-            log "Deploy Directory: $DEPLOY_DIR"
-            log "PID File: $PID_FILE"
-            
-            # Step 1: Backup current working container (if exists)
-            OLD_PID=""
-            if docker ps | grep -q "$CONTAINER_NAME"; then
-              log "Step 1: Backing up current working container..."
-              OLD_CONTAINER_ID=$(docker ps -q -f name="$CONTAINER_NAME")
-              # Get the actual image tag from the running container
-              OLD_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
-              # If no image found, try to find any version-tagged image
-              if [ -z "$OLD_IMAGE" ]; then
-                OLD_IMAGE=$(docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep -E ':[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "")
-              fi
-              OLD_PID=$(get_container_pid)
-              
-              log "  Current container ID: $OLD_CONTAINER_ID"
-              log "  Current image: $OLD_IMAGE"
-              log "  Current PID: $OLD_PID"
-              
-              if docker images | grep -q "$(echo $OLD_IMAGE | cut -d: -f1)"; then
-                docker save "$OLD_IMAGE" -o "$BACKUP_DIR/last-working-image.tar" 2>/dev/null && \
-                log "  ✓ Image backed up to $BACKUP_DIR/last-working-image.tar" || \
-                log "  ⚠ Warning: Could not backup image"
-              fi
-            else
-              log "Step 1: No existing container found (first deployment or container stopped)"
-              if docker ps -a | grep -q "$CONTAINER_NAME"; then
-                log "  Found stopped container, removing it..."
-                docker rm "$CONTAINER_NAME" 2>/dev/null || true
-              fi
-            fi
-            
-            # Step 2: Build new Docker image (while old container is still running - ZERO DOWNTIME)
-            log "Step 2: Building new Docker image (old container still serving traffic)..."
+            # Extract and validate version
             cd "$TEMP_DEPLOY"
+            APP_VERSION=$(jq -r .version package.json 2>/dev/null || grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "")
             
-            # Extract version from package.json (robust extraction with fallback)
-            if command -v jq >/dev/null 2>&1; then
-              APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "")
-            else
-              APP_VERSION=$(grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "")
-            fi
-            
-            # Fallback: try to extract version using sed if above methods fail
-            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
-              APP_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "")
-            fi
-            
-            # Final validation - version must be in format x.y.z
             if [ -z "$APP_VERSION" ] || ! echo "$APP_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-              log "✗ ERROR: Could not extract valid version from package.json"
-              log "  Please ensure package.json has a valid version field (e.g., \"0.6.0\")"
+              echo "✗ ERROR: Invalid version in package.json"
               exit 1
             fi
             
-            APP_NAME=$(jq -r .name package.json 2>/dev/null || grep -oP '"name"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "$IMAGE_NAME")
-            GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
-            BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
+            echo "Building image: $IMAGE_NAME:$APP_VERSION"
             
-            log "  Building image with version: $APP_VERSION"
-            log "  Git commit: $GIT_COMMIT"
-            log "  Build date: $BUILD_DATE"
-            
-            # Build with cache from previous version if available
-            BUILD_ARGS=""
-            PREV_VERSION=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "")
-            if [ -n "$PREV_VERSION" ]; then
-              log "  Using previous version ($PREV_VERSION) as cache..."
-              BUILD_ARGS="--cache-from $IMAGE_NAME:$PREV_VERSION"
+            # Backup current image if container exists
+            if docker ps --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+              OLD_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+              if [ -n "$OLD_IMAGE" ] && docker images | grep -q "$(echo $OLD_IMAGE | cut -d: -f1)"; then
+                docker save "$OLD_IMAGE" -o "$BACKUP_DIR/last-working-image.tar" 2>/dev/null || true
+              fi
             fi
             
-            # Build image with labels - ONLY tag with version (no 'latest', no 'unknown')
+            # Build with cache if previous version exists
+            PREV_VERSION=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "")
+            BUILD_ARGS=""
+            [ -n "$PREV_VERSION" ] && BUILD_ARGS="--cache-from $IMAGE_NAME:$PREV_VERSION"
+            
+            # Build Docker image
             docker build \
-              --label="org.opencontainers.image.created=$BUILD_DATE" \
-              --label="org.opencontainers.image.title=$APP_NAME" \
-              --label="org.opencontainers.image.revision=$GIT_COMMIT" \
               --label="org.opencontainers.image.version=$APP_VERSION" \
+              --label="org.opencontainers.image.revision=$(git log -1 --format=%h 2>/dev/null || echo 'unknown')" \
               $BUILD_ARGS \
               -t "$IMAGE_NAME:$APP_VERSION" \
-              . || {
-                log "✗ ERROR: Docker build failed"
+              . || exit 1
+            
+            # Setup docker-compose
+            cd "$DEPLOY_DIR"
+            if [ ! -f "docker-compose.yml" ]; then
+              cat > docker-compose.yml <<EOF
+            version: '3.8'
+            services:
+              $CONTAINER_NAME:
+                image: $IMAGE_NAME:$APP_VERSION
+                container_name: $CONTAINER_NAME
+                restart: unless-stopped
+                ports:
+                  - "3001:3001"
+                environment:
+                  - NODE_ENV=production
+                  - PORT=3001
+                  - HOSTNAME=0.0.0.0
+            EOF
+            else
+              sed -i "s|image: $IMAGE_NAME:.*|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
+            fi
+            
+            # Remove old container
+            docker stop "$CONTAINER_NAME" 2>/dev/null || true
+            docker rm "$CONTAINER_NAME" 2>/dev/null || true
+            
+            # Start new container
+            docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
+              echo "✗ Failed to start container"
+              [ -f "$BACKUP_DIR/last-working-image.tar" ] && docker load -i "$BACKUP_DIR/last-working-image.tar" || true
+              exit 1
+            }
+            
+            # Health check
+            echo "Waiting for container to be ready..."
+            for i in {1..40}; do
+              if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001" 2>/dev/null || \
+                 timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
+                echo "✓ Container is healthy"
+                break
+              fi
+              [ $i -eq 40 ] && {
+                echo "✗ Health check failed"
+                docker logs "$CONTAINER_NAME" --tail 50
+                [ -f "$BACKUP_DIR/last-working-image.tar" ] && docker load -i "$BACKUP_DIR/last-working-image.tar" || true
                 exit 1
               }
+              sleep 3
+            done
             
-            log "  ✓ Image built and tagged as: $IMAGE_NAME:$APP_VERSION"
+            # Clean up old images
+            CURRENT_ID=$(docker images "$IMAGE_NAME:$APP_VERSION" --format "{{.ID}}" 2>/dev/null || echo "")
+            docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | while read -r tag; do
+              [ -z "$tag" ] || [ "$tag" = "$APP_VERSION" ] && continue
+              docker rmi "$IMAGE_NAME:$tag" 2>/dev/null || true
+            done || true
             
-            # Step 3: Zero-downtime container update
-            log "Step 3: Performing zero-downtime container update..."
-            cd "$DEPLOY_DIR"
+            docker image prune -f 2>/dev/null || true
             
-            # Verify docker-compose.yml exists
-            if [ ! -f "docker-compose.yml" ] && [ ! -f "docker-compose.yaml" ]; then
-              log "⚠ WARNING: docker-compose.yml not found, creating basic one..."
-              {
-                echo "version: '3.8'"
-                echo "services:"
-                echo "  $CONTAINER_NAME:"
-                echo "    image: $IMAGE_NAME:$APP_VERSION"
-                echo "    container_name: $CONTAINER_NAME"
-                echo "    restart: unless-stopped"
-                echo "    ports:"
-                echo "      - \"3001:3001\""
-                echo "    environment:"
-                echo "      - NODE_ENV=production"
-                echo "      - PORT=3001"
-                echo "      - HOSTNAME=0.0.0.0"
-              } > docker-compose.yml
-              log "  Created basic docker-compose.yml with version tag: $APP_VERSION"
-            else
-              # Update existing docker-compose.yml to use version tag instead of latest
-              if grep -q "image: $IMAGE_NAME:latest" docker-compose.yml 2>/dev/null; then
-                log "  Updating docker-compose.yml to use version tag: $APP_VERSION"
-                sed -i "s|image: $IMAGE_NAME:latest|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
-              fi
-            fi
-            
-            # Remove old container if it exists (ensures clean deployment)
-            if docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
-              log "  Removing old container before creating new one..."
-              docker stop "$CONTAINER_NAME" 2>/dev/null || true
-              docker rm "$CONTAINER_NAME" 2>/dev/null || true
-              log "  ✓ Old container removed"
-            fi
-            
-            # Create new container with new image
-            log "  Starting new container..."
-            if ! docker compose up -d --no-deps --pull never "$CONTAINER_NAME" 2>&1; then
-              log "✗ ERROR: Failed to start new container"
-              log "  Checking if container exists..."
-              docker ps -a --filter name="$CONTAINER_NAME" || true
-              log "  Checking container logs for errors..."
-              docker logs "$CONTAINER_NAME" --tail 50 2>&1 || true
-              log "  Checking docker-compose configuration..."
-              docker compose config 2>&1 | head -20 || true
-              rollback
-              exit 1
-            fi
-            
-            log "  New container started, waiting for it to initialize..."
-            sleep 5
-            
-            # Check if container is still running (more robust check)
-            CONTAINER_STATUS=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-            if [ -z "$CONTAINER_STATUS" ]; then
-              STOPPED_STATUS=$(docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-              if [ -n "$STOPPED_STATUS" ]; then
-                log "✗ ERROR: Container stopped immediately after start"
-                log "  Container status: $STOPPED_STATUS"
-                log "  Last 100 lines of container logs:"
-                docker logs "$CONTAINER_NAME" --tail 100 2>&1 || true
-                rollback
-                exit 1
-              else
-                log "⚠ WARNING: Could not determine container status, continuing..."
-              fi
-            else
-              log "  Container is running (Status: $CONTAINER_STATUS)"
-            fi
-            
-            log "  Waiting additional time for application to be ready..."
-            sleep 10
-            
-            # Step 4: Health check and PID tracking
-            log "Step 4: Performing health check and PID tracking..."
-            CONTAINER_RUNNING=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Names}}" 2>/dev/null || echo "")
-            if [ -z "$CONTAINER_RUNNING" ]; then
-              log "✗ ERROR: Container is not running before health check"
-              log "  Checking what happened..."
-              docker ps -a --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}" || true
-              log "  Container logs:"
-              docker logs "$CONTAINER_NAME" 2>&1 | tail -50 || true
-              rollback
-              exit 1
-            fi
-            
-            if ! health_check; then
-              FINAL_CHECK=$(docker ps --filter name="$CONTAINER_NAME" --format "{{.Status}}" 2>/dev/null || echo "")
-              if [ -n "$FINAL_CHECK" ]; then
-                log "⚠ WARNING: Health check reported failure but container is still running"
-                log "  Container status: $FINAL_CHECK"
-                log "  Accepting deployment - container appears to be running"
-                FINAL_PID=$(get_container_pid)
-                if [ -n "$FINAL_PID" ]; then
-                  save_pid "$FINAL_PID"
-                  log "  Saved PID: $FINAL_PID"
-                fi
-              else
-                log "✗ ERROR: New container failed health check and is not running"
-                log "  Attempting to diagnose the issue..."
-                log "  Container details:"
-                docker inspect "$CONTAINER_NAME" 2>/dev/null | grep -A 10 '"State"' || true
-                log "  Full container logs:"
-                docker logs "$CONTAINER_NAME" 2>&1 | tail -100 || true
-                rollback
-                exit 1
-              fi
-            fi
-            
-            # Step 5: Verify deployment and track PID
-            NEW_PID=$(get_container_pid)
-            SAVED_PID=$(get_saved_pid)
-            
-            log "Step 5: Deployment verification..."
-            log "  New container PID: $NEW_PID"
-            log "  Saved PID: $SAVED_PID"
-            
-            if [ "$NEW_PID" != "$SAVED_PID" ] && [ -n "$NEW_PID" ]; then
-              log "  ⚠ PID mismatch detected, updating PID file..."
-              save_pid "$NEW_PID"
-            fi
-            
-            show_process_info "$NEW_PID"
-            
-            # Step 6: Container resource monitoring
-            log "Step 6: Container resource usage:"
-            docker stats --no-stream "$CONTAINER_NAME" --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" || true
-            
-            # Step 7: Cleanup old images (keep only current version tag)
-            log "Step 7: Cleaning up old Docker images..."
-            
-            IMAGE_COUNT_BEFORE=$(docker images "$IMAGE_NAME" --format "{{.ID}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            log "  Images before cleanup: $IMAGE_COUNT_BEFORE"
-            
-            # Remove all tags except the current version
-            ALL_TAGS=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null || echo "")
-            if [ -n "$ALL_TAGS" ]; then
-              echo "$ALL_TAGS" | while IFS= read -r tag || [ -n "$tag" ]; do
-                if [ -n "$tag" ] && [ "$tag" != "$APP_VERSION" ]; then
-                  docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "    ✓ Removed: $IMAGE_NAME:$tag" || log "    ⚠ Skipped: $IMAGE_NAME:$tag (may be in use)"
-                fi
-              done || true
-            fi
-            
-            # Remove dangling images
-            DANGLING_COUNT=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            if [ "$DANGLING_COUNT" -gt 0 ]; then
-              docker image prune -f 2>/dev/null && log "    ✓ Removed $DANGLING_COUNT dangling images" || true
-            fi
-            
-            # Clean up old unused images (older than 12 hours)
-            docker image prune -af --filter "until=12h" 2>/dev/null || true
-            
-            IMAGE_COUNT_AFTER=$(docker images "$IMAGE_NAME" --format "{{.ID}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            log "  Images after cleanup: $IMAGE_COUNT_AFTER"
-            log "  ✓ Image cleanup completed (kept only: $IMAGE_NAME:$APP_VERSION)"
-            
-            # Step 8: Cleanup temporary deployment files
-            log "Step 8: Cleaning up temporary files..."
+            # Cleanup temp files
             rm -rf "$TEMP_DEPLOY"
-            log "  ✓ Temporary files removed"
             
-            # Step 9: Final deployment status report
-            log "=========================================="
-            log "Deployment completed successfully!"
-            log "=========================================="
-            log "Container Name: $CONTAINER_NAME"
-            log "Container PID: $NEW_PID (tracked in $PID_FILE)"
-            log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
-            log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
-            log "Image Version: $APP_VERSION"
-            log "Image Tag: $IMAGE_NAME:$APP_VERSION"
-            log "Git Commit: $GIT_COMMIT"
-            
-            echo ""
-            echo "Container Details:"
-            docker ps --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}\t{{.Size}}"
-            
-            echo ""
-            echo "PID Tracking:"
-            if [ -f "$PID_FILE" ]; then
-              echo "  PID File: $PID_FILE"
-              echo "  PID Value: $(cat $PID_FILE)"
-              echo "  Process Status: $(ps -p $(cat $PID_FILE) -o stat= 2>/dev/null || echo 'not running')"
-            else
-              echo "  ⚠ PID file not found"
-            fi
-            
-            log "=========================================="
-            log "Deployment Summary:"
-            log "  Old PID: ${OLD_PID:-none}"
-            log "  New PID: $NEW_PID"
-            log "  Downtime: ~1-2 seconds (container swap)"
-            log "  Rollback available: $([ -f "$BACKUP_DIR/last-working-image.tar" ] && echo 'yes' || echo 'no')"
-            log "=========================================="
+            echo "✓ Deployment completed successfully"
+            echo "Image: $IMAGE_NAME:$APP_VERSION"
+            docker ps --filter name="$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
