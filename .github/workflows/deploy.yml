@@ -33,6 +33,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    # Don't run CI when manually triggering production (production uses existing image)
+    if: |
+      github.event_name != 'workflow_dispatch' || 
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment != 'production')
     
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
@@ -235,12 +239,30 @@ jobs:
   deploy-prod:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: deploy-dev
+    # When manually triggered: work independently, use existing image from dev
+    # When auto-triggered: depends on deploy-dev success
+    needs: 
+      - ci
+      - deploy-dev
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') ||
+      (github.event_name == 'push' && needs.deploy-dev.result == 'success')
     environment:
       name: production
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
     
     steps:
+      - name: Checkout code (to get version)
+        uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
+      
+      - name: Get version from package.json
+        id: version
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          VERSION=$(jq -r .version package.json)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Using version: $VERSION (image already built and tested in dev)"
+      
       - name: Deploy to Production Server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -252,10 +274,21 @@ jobs:
             set -e
             
             REGISTRY="${{ env.REGISTRY }}"
-            IMAGE_NAME="${{ needs.deploy-dev.outputs.image-name }}"
+            IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
-            VERSION="${{ needs.deploy-dev.outputs.version }}"
+            
+            # Get version: from deploy-dev output (if available) or from step output (manual)
+            VERSION="${{ needs.deploy-dev.outputs.version || steps.version.outputs.version }}"
+            
+            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+              echo "✗ ERROR: Could not determine version"
+              echo "Make sure dev deployment succeeded first, or version exists in package.json"
+              exit 1
+            fi
+            
+            echo "Deploying image: ${IMAGE_NAME}:${VERSION}"
+            echo "This image was already built and successfully deployed to dev"
             
             # Login to registry (requires GHCR_TOKEN secret)
             echo "${{ secrets.GHCR_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
