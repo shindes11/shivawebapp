@@ -221,40 +221,68 @@ jobs:
             log "Starting Development Deployment"
             log "=========================================="
             
-            # Extract version from package.json (optional – used only for logging in dev)
+            # Extract version from package.json (robust extraction with fallback)
             cd "$TEMP_DEPLOY"
-            APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "unknown")
-            APP_NAME=$(jq -r .name package.json 2>/dev/null || echo "$IMAGE_NAME")
+            if command -v jq >/dev/null 2>&1; then
+              APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "")
+            else
+              APP_VERSION=$(grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "")
+            fi
+            
+            # Fallback: try to extract version using sed if above methods fail
+            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
+              APP_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "")
+            fi
+            
+            # If still no version, use 'dev' as fallback for development
+            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
+              APP_VERSION="dev"
+              log "⚠ WARNING: Could not extract version from package.json, using 'dev' tag"
+            fi
+            
+            APP_NAME=$(jq -r .name package.json 2>/dev/null || grep -oP '"name"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "$IMAGE_NAME")
             GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
             BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
             
-            log "Building development image (tag: latest, version: $APP_VERSION)"
+            log "Building development image (tag: $APP_VERSION)"
             
-            # Build Docker image (only keep a single 'latest' tag in development)
+            # Build Docker image with version tag
             docker build \
               --label="org.opencontainers.image.created=$BUILD_DATE" \
               --label="org.opencontainers.image.title=$APP_NAME" \
               --label="org.opencontainers.image.revision=$GIT_COMMIT" \
               --label="org.opencontainers.image.version=$APP_VERSION" \
-              -t "$IMAGE_NAME:latest" \
+              -t "$IMAGE_NAME:$APP_VERSION" \
               . || {
                 log "✗ ERROR: Docker build failed"
                 exit 1
               }
             
-            log "✓ Image built: $IMAGE_NAME:latest (version: $APP_VERSION)"
+            log "✓ Image built: $IMAGE_NAME:$APP_VERSION"
 
-            # Optional: clean up any old dev tags except 'latest'
-            if docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -q .; then
-              log "Cleaning up old development image tags for $IMAGE_NAME (keeping only 'latest')..."
-              docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | while read -r tag; do
-                if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+            # Clean up old development images and dangling images
+            log "Cleaning up old development images..."
+            
+            # Remove all old tags except current version
+            ALL_TAGS=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null || echo "")
+            if [ -n "$ALL_TAGS" ]; then
+              echo "$ALL_TAGS" | while IFS= read -r tag || [ -n "$tag" ]; do
+                if [ -n "$tag" ] && [ "$tag" != "$APP_VERSION" ]; then
                   docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && \
-                    log "  ✓ Removed dev tag: $IMAGE_NAME:$tag" || \
-                    log "  ⚠ Skipped dev tag (in use or already gone): $IMAGE_NAME:$tag"
+                    log "  ✓ Removed old tag: $IMAGE_NAME:$tag" || \
+                    log "  ⚠ Skipped tag (in use): $IMAGE_NAME:$tag"
                 fi
-              done
+              done || true
             fi
+            
+            # Remove dangling images (<none> tags)
+            DANGLING_COUNT=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+            if [ "$DANGLING_COUNT" -gt 0 ]; then
+              docker image prune -f 2>/dev/null && log "  ✓ Removed $DANGLING_COUNT dangling images" || true
+            fi
+            
+            # Clean up unused images older than 12 hours
+            docker image prune -af --filter "until=12h" 2>/dev/null || true
             
             # Deploy container
             cd "$DEPLOY_DIR"
@@ -266,7 +294,7 @@ jobs:
                 echo "version: '3.8'"
                 echo "services:"
                 echo "  $CONTAINER_NAME:"
-                echo "    image: $IMAGE_NAME:latest"
+                echo "    image: $IMAGE_NAME:$APP_VERSION"
                 echo "    container_name: $CONTAINER_NAME"
                 echo "    restart: unless-stopped"
                 echo "    ports:"
@@ -278,9 +306,14 @@ jobs:
                 echo "      - NEXT_PUBLIC_BASE_PATH="
                 echo "    network_mode: bridge"
               } > docker-compose.yml
-              log "  Created docker-compose.yml with proper port binding"
+              log "  Created docker-compose.yml with version tag: $APP_VERSION"
             else
               log "  Using existing docker-compose.yml"
+              # Update to use version tag if it's using latest
+              if grep -q "image: $IMAGE_NAME:latest" docker-compose.yml 2>/dev/null; then
+                log "  Updating docker-compose.yml to use version tag: $APP_VERSION"
+                sed -i "s|image: $IMAGE_NAME:latest|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
+              fi
               # Ensure ports are properly configured
               if ! grep -q "0.0.0.0:3001" docker-compose.yml 2>/dev/null; then
                 log "  ⚠ WARNING: Port binding might not be correct in existing docker-compose.yml"
@@ -288,7 +321,15 @@ jobs:
               fi
             fi
             
-            log "Starting container..."
+            # Remove old container if it exists (to ensure clean deployment)
+            if docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+              log "Removing old container before creating new one..."
+              docker stop "$CONTAINER_NAME" 2>/dev/null || true
+              docker rm "$CONTAINER_NAME" 2>/dev/null || true
+              log "  ✓ Old container removed"
+            fi
+            
+            log "Starting new container..."
             docker compose up -d --no-deps --pull never "$CONTAINER_NAME" || {
               log "✗ ERROR: Failed to start container"
               log "  Checking docker-compose status..."
@@ -746,7 +787,15 @@ jobs:
               fi
             fi
             
-            # Update container with new image (old container keeps running until new one is ready)
+            # Remove old container if it exists (ensures clean deployment)
+            if docker ps -a --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+              log "  Removing old container before creating new one..."
+              docker stop "$CONTAINER_NAME" 2>/dev/null || true
+              docker rm "$CONTAINER_NAME" 2>/dev/null || true
+              log "  ✓ Old container removed"
+            fi
+            
+            # Create new container with new image
             log "  Starting new container..."
             if ! docker compose up -d --no-deps --pull never "$CONTAINER_NAME" 2>&1; then
               log "✗ ERROR: Failed to start new container"
