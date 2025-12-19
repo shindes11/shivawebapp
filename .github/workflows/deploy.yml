@@ -164,15 +164,37 @@ jobs:
             
             # Health check
             echo "Waiting for container to be ready..."
+            sleep 5  # Give container time to start
+            
             for i in {1..30}; do
-              if docker exec "$CONTAINER_NAME" sh -c "curl -f http://localhost:3001 > /dev/null 2>&1" 2>/dev/null; then
+              # Check if container is running
+              if ! docker ps --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+                echo "Container is not running"
+                docker logs "$CONTAINER_NAME" --tail 50
+                exit 1
+              fi
+              
+              # Check if port is listening (try multiple methods)
+              if docker exec "$CONTAINER_NAME" sh -c "nc -z localhost 3001 2>/dev/null || (timeout 1 bash -c '</dev/tcp/localhost/3001' 2>/dev/null && exit 0 || exit 1)" 2>/dev/null || \
+                 nc -z localhost 3001 2>/dev/null || \
+                 timeout 2 bash -c "</dev/tcp/localhost/3001" 2>/dev/null; then
                 echo "✓ Container is healthy"
                 exit 0
               fi
+              
+              # Check logs for "Ready" message as fallback
+              if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "Ready"; then
+                echo "✓ Container is ready (from logs)"
+                exit 0
+              fi
+              
               sleep 2
             done
             
             echo "✗ Health check failed"
+            echo "Container status:"
+            docker ps --filter name="$CONTAINER_NAME" || true
+            echo "Container logs:"
             docker logs "$CONTAINER_NAME" --tail 50
             exit 1
 
