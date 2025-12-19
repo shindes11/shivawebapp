@@ -53,7 +53,11 @@ jobs:
           NEXT_TELEMETRY_DISABLED: 1
 
       - name: Verify build
-        run: test -d .next || (echo "Build failed: .next directory not found" && exit 1)
+        run: |
+          if [ ! -d .next ]; then
+            echo "Build failed: .next directory not found"
+            exit 1
+          fi
 
   deploy-dev:
     name: Deploy to Development
@@ -113,20 +117,7 @@ jobs:
             # Setup docker-compose
             cd "$DEPLOY_DIR"
             if [ ! -f "docker-compose.yml" ]; then
-              cat > docker-compose.yml <<EOF
-            version: '3.8'
-            services:
-              $CONTAINER_NAME:
-                image: $IMAGE_NAME:$APP_VERSION
-                container_name: $CONTAINER_NAME
-                restart: unless-stopped
-                ports:
-                  - "0.0.0.0:3001:3001"
-                environment:
-                  - NODE_ENV=development
-                  - PORT=3001
-                  - HOSTNAME=0.0.0.0
-            EOF
+              printf 'version: '\''3.8'\''\nservices:\n  %s:\n    image: %s:%s\n    container_name: %s\n    restart: unless-stopped\n    ports:\n      - "0.0.0.0:3001:3001"\n    environment:\n      - NODE_ENV=development\n      - PORT=3001\n      - HOSTNAME=0.0.0.0\n' "$CONTAINER_NAME" "$IMAGE_NAME" "$APP_VERSION" "$CONTAINER_NAME" > docker-compose.yml
             else
               sed -i "s|image: $IMAGE_NAME:.*|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
             fi
@@ -242,20 +233,7 @@ jobs:
             # Setup docker-compose
             cd "$DEPLOY_DIR"
             if [ ! -f "docker-compose.yml" ]; then
-              cat > docker-compose.yml <<EOF
-            version: '3.8'
-            services:
-              $CONTAINER_NAME:
-                image: $IMAGE_NAME:$APP_VERSION
-                container_name: $CONTAINER_NAME
-                restart: unless-stopped
-                ports:
-                  - "3001:3001"
-                environment:
-                  - NODE_ENV=production
-                  - PORT=3001
-                  - HOSTNAME=0.0.0.0
-            EOF
+              printf 'version: '\''3.8'\''\nservices:\n  %s:\n    image: %s:%s\n    container_name: %s\n    restart: unless-stopped\n    ports:\n      - "3001:3001"\n    environment:\n      - NODE_ENV=production\n      - PORT=3001\n      - HOSTNAME=0.0.0.0\n' "$CONTAINER_NAME" "$IMAGE_NAME" "$APP_VERSION" "$CONTAINER_NAME" > docker-compose.yml
             else
               sed -i "s|image: $IMAGE_NAME:.*|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
             fi
@@ -293,7 +271,7 @@ jobs:
             docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | while read -r tag; do
               [ -z "$tag" ] || [ "$tag" = "$APP_VERSION" ] && continue
               docker rmi "$IMAGE_NAME:$tag" 2>/dev/null || true
-            done || true
+              done || true
             
             docker image prune -f 2>/dev/null || true
             
