@@ -242,8 +242,7 @@ jobs:
     # Production deployment:
     # - Manual trigger: Independent, uses existing image from dev (no rebuild/test)
     # - Auto trigger: Depends on deploy-dev success
-    # Note: When manually triggered, version comes from package.json
-    #       The image should already exist in registry from previous dev deployment
+    # Note: Version comes from package.json (image already exists in registry from dev)
     if: |
       (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') ||
       (github.event_name == 'push' && needs.deploy-dev.result == 'success')
@@ -279,12 +278,8 @@ jobs:
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
             
-            # Get version: prefer deploy-dev output if available, otherwise use from package.json
-            if [ -n "${{ needs.deploy-dev.outputs.version }}" ] && [ "${{ needs.deploy-dev.outputs.version }}" != "null" ]; then
-              VERSION="${{ needs.deploy-dev.outputs.version }}"
-            else
-              VERSION="${{ steps.version.outputs.version }}"
-            fi
+            # Get version from package.json (image already exists in registry from dev)
+            VERSION="${{ steps.version.outputs.version }}"
             
             if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
               echo "✗ ERROR: Could not determine version"
