@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { generateConversationName } from '@/utils/chatUtils';
 
 type Message = {
   id: string;
@@ -9,6 +10,7 @@ type Message = {
 export function useChat(token: string, oldestTenantId: string | null, oldestUserId: string | null) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Only log token in development and if it exists
   if (process.env.NODE_ENV === 'development' && token) {
@@ -32,16 +34,23 @@ export function useChat(token: string, oldestTenantId: string | null, oldestUser
     setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'user', content: message }]);
 
     try {
-      const sessionResponse = await fetch('/api/sessions/create', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          accept: 'application/json',
-        },
-        body: JSON.stringify({}),
-      });
-      const sessionData = await sessionResponse.json();
-      const sessionId = sessionData.session_id;
+      // Only create a new session if we don't have one
+      let sessionId = currentSessionId;
+      const isNewSession = !sessionId;
+      
+      if (!sessionId) {
+        const sessionResponse = await fetch('/api/sessions/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            accept: 'application/json',
+          },
+          body: JSON.stringify({}),
+        });
+        const sessionData = await sessionResponse.json();
+        sessionId = sessionData.session_id;
+        setCurrentSessionId(sessionId);
+      }
 
       const formattedInput = {
         input: JSON.stringify({
@@ -69,6 +78,11 @@ export function useChat(token: string, oldestTenantId: string | null, oldestUser
 
       setMessages((prev) => [...prev, { id: Date.now().toString(), role: 'assistant', content: assistantResponse }]);
 
+      // Generate dynamic conversation name from the first question in the session
+      const conversationName = isNewSession 
+        ? generateConversationName(message)
+        : undefined; // Don't update chatname for subsequent messages in the same session
+
       await fetch('https://v2api.humac.live/api/rest/insert-shivachat-chatlog-one', {
         method: 'POST',
         headers: {
@@ -82,9 +96,8 @@ export function useChat(token: string, oldestTenantId: string | null, oldestUser
             tenantId: oldestTenantId,
             sessionid: sessionId,
             userId: oldestUserId,
-            date:formatDate(new Date()),
-            chatname: `Chat-${oldestTenantId || 'Tenant'}-${oldestUserId || 'User'}-${formatDate(new Date())}`,
-
+            date: formatDate(new Date()),
+            chatname: conversationName || `Chat-${oldestTenantId || 'Tenant'}-${oldestUserId || 'User'}-${formatDate(new Date())}`,
           },
         }),
       });
