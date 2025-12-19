@@ -637,7 +637,12 @@ jobs:
             if docker ps | grep -q "$CONTAINER_NAME"; then
               log "Step 1: Backing up current working container..."
               OLD_CONTAINER_ID=$(docker ps -q -f name="$CONTAINER_NAME")
-              OLD_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "$IMAGE_NAME:latest")
+              # Get the actual image tag from the running container
+              OLD_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || echo "")
+              # If no image found, try to find any version-tagged image
+              if [ -z "$OLD_IMAGE" ]; then
+                OLD_IMAGE=$(docker images "$IMAGE_NAME" --format "{{.Repository}}:{{.Tag}}" 2>/dev/null | grep -E ':[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "")
+              fi
               OLD_PID=$(get_container_pid)
               
               log "  Current container ID: $OLD_CONTAINER_ID"
@@ -661,9 +666,26 @@ jobs:
             log "Step 2: Building new Docker image (old container still serving traffic)..."
             cd "$TEMP_DEPLOY"
             
-            # Extract version from package.json
-            APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "unknown")
-            APP_NAME=$(jq -r .name package.json 2>/dev/null || echo "$IMAGE_NAME")
+            # Extract version from package.json (robust extraction with fallback)
+            if command -v jq >/dev/null 2>&1; then
+              APP_VERSION=$(jq -r .version package.json 2>/dev/null || echo "")
+            else
+              APP_VERSION=$(grep -oP '"version"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "")
+            fi
+            
+            # Fallback: try to extract version using sed if above methods fail
+            if [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ]; then
+              APP_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1 || echo "")
+            fi
+            
+            # Final validation - version must be in format x.y.z
+            if [ -z "$APP_VERSION" ] || ! echo "$APP_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+              log "✗ ERROR: Could not extract valid version from package.json"
+              log "  Please ensure package.json has a valid version field (e.g., \"0.6.0\")"
+              exit 1
+            fi
+            
+            APP_NAME=$(jq -r .name package.json 2>/dev/null || grep -oP '"name"\s*:\s*"\K[^"]+' package.json 2>/dev/null || echo "$IMAGE_NAME")
             GIT_COMMIT=$(git log -1 --format=%h 2>/dev/null || echo "unknown")
             BUILD_DATE=$(date --rfc-3339=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date +"%Y-%m-%dT%H:%M:%S%z")
             
@@ -671,34 +693,28 @@ jobs:
             log "  Git commit: $GIT_COMMIT"
             log "  Build date: $BUILD_DATE"
             
-            # Build with cache, labels, and version tag
+            # Build with cache from previous version if available
             BUILD_ARGS=""
-            if docker images | grep -q "$IMAGE_NAME"; then
-              log "  Using existing image as cache..."
-              BUILD_ARGS="--cache-from $IMAGE_NAME:latest"
+            PREV_VERSION=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || echo "")
+            if [ -n "$PREV_VERSION" ]; then
+              log "  Using previous version ($PREV_VERSION) as cache..."
+              BUILD_ARGS="--cache-from $IMAGE_NAME:$PREV_VERSION"
             fi
             
-            # Build image with labels and version tag
+            # Build image with labels - ONLY tag with version (no 'latest', no 'unknown')
             docker build \
               --label="org.opencontainers.image.created=$BUILD_DATE" \
               --label="org.opencontainers.image.title=$APP_NAME" \
               --label="org.opencontainers.image.revision=$GIT_COMMIT" \
               --label="org.opencontainers.image.version=$APP_VERSION" \
               $BUILD_ARGS \
-              -t "$IMAGE_NAME:latest" \
               -t "$IMAGE_NAME:$APP_VERSION" \
               . || {
                 log "✗ ERROR: Docker build failed"
                 exit 1
               }
             
-            # Tag with timestamp for version tracking
-            TIMESTAMP_TAG=$(date +%Y%m%d-%H%M%S)
-            docker tag "$IMAGE_NAME:latest" "$IMAGE_NAME:$TIMESTAMP_TAG"
-            log "  ✓ Image built and tagged as:"
-            log "    - $IMAGE_NAME:latest"
-            log "    - $IMAGE_NAME:$APP_VERSION"
-            log "    - $IMAGE_NAME:$TIMESTAMP_TAG"
+            log "  ✓ Image built and tagged as: $IMAGE_NAME:$APP_VERSION"
             
             # Step 3: Zero-downtime container update
             log "Step 3: Performing zero-downtime container update..."
@@ -711,7 +727,7 @@ jobs:
                 echo "version: '3.8'"
                 echo "services:"
                 echo "  $CONTAINER_NAME:"
-                echo "    image: $IMAGE_NAME:latest"
+                echo "    image: $IMAGE_NAME:$APP_VERSION"
                 echo "    container_name: $CONTAINER_NAME"
                 echo "    restart: unless-stopped"
                 echo "    ports:"
@@ -721,7 +737,13 @@ jobs:
                 echo "      - PORT=3001"
                 echo "      - HOSTNAME=0.0.0.0"
               } > docker-compose.yml
-              log "  Created basic docker-compose.yml"
+              log "  Created basic docker-compose.yml with version tag: $APP_VERSION"
+            else
+              # Update existing docker-compose.yml to use version tag instead of latest
+              if grep -q "image: $IMAGE_NAME:latest" docker-compose.yml 2>/dev/null; then
+                log "  Updating docker-compose.yml to use version tag: $APP_VERSION"
+                sed -i "s|image: $IMAGE_NAME:latest|image: $IMAGE_NAME:$APP_VERSION|g" docker-compose.yml
+              fi
             fi
             
             # Update container with new image (old container keeps running until new one is ready)
@@ -817,44 +839,34 @@ jobs:
             log "Step 6: Container resource usage:"
             docker stats --no-stream "$CONTAINER_NAME" --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}" || true
             
-            # Step 7: Cleanup old images (keep only latest and current version)
+            # Step 7: Cleanup old images (keep only current version tag)
             log "Step 7: Cleaning up old Docker images..."
             
             IMAGE_COUNT_BEFORE=$(docker images "$IMAGE_NAME" --format "{{.ID}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
             log "  Images before cleanup: $IMAGE_COUNT_BEFORE"
             
-            OLD_TAGS=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null | grep -E "^[0-9]{8}-" 2>/dev/null | sort -r 2>/dev/null || echo "")
-            if [ -n "$OLD_TAGS" ]; then
-              echo "$OLD_TAGS" | while IFS= read -r tag || [ -n "$tag" ]; do
-                if [ -n "$tag" ] && [ "$tag" != "$TIMESTAMP_TAG" ]; then
-                  docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "    ✓ Removed: $IMAGE_NAME:$tag" || log "    ⚠ Could not remove: $IMAGE_NAME:$tag (may be in use)"
-                fi
-              done || true
-            fi
-            
-            if [ -n "$TIMESTAMP_TAG" ]; then
-              docker rmi "$IMAGE_NAME:$TIMESTAMP_TAG" 2>/dev/null && log "    ✓ Removed current timestamp tag: $IMAGE_NAME:$TIMESTAMP_TAG" || true
-            fi
-            
-            DANGLING_COUNT=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ' || echo "0")
-            if [ "$DANGLING_COUNT" -gt 0 ]; then
-              docker image prune -f 2>/dev/null && log "    ✓ Removed $DANGLING_COUNT dangling images" || true
-            fi
-            
-            docker image prune -af --filter "until=12h" 2>/dev/null || true
-            
+            # Remove all tags except the current version
             ALL_TAGS=$(docker images "$IMAGE_NAME" --format "{{.Tag}}" 2>/dev/null || echo "")
             if [ -n "$ALL_TAGS" ]; then
               echo "$ALL_TAGS" | while IFS= read -r tag || [ -n "$tag" ]; do
-                if [ -n "$tag" ] && [ "$tag" != "latest" ] && [ "$tag" != "$APP_VERSION" ]; then
+                if [ -n "$tag" ] && [ "$tag" != "$APP_VERSION" ]; then
                   docker rmi "$IMAGE_NAME:$tag" 2>/dev/null && log "    ✓ Removed: $IMAGE_NAME:$tag" || log "    ⚠ Skipped: $IMAGE_NAME:$tag (may be in use)"
                 fi
               done || true
             fi
             
+            # Remove dangling images
+            DANGLING_COUNT=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+            if [ "$DANGLING_COUNT" -gt 0 ]; then
+              docker image prune -f 2>/dev/null && log "    ✓ Removed $DANGLING_COUNT dangling images" || true
+            fi
+            
+            # Clean up old unused images (older than 12 hours)
+            docker image prune -af --filter "until=12h" 2>/dev/null || true
+            
             IMAGE_COUNT_AFTER=$(docker images "$IMAGE_NAME" --format "{{.ID}}" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
             log "  Images after cleanup: $IMAGE_COUNT_AFTER"
-            log "  ✓ Image cleanup completed (kept: $IMAGE_NAME:latest and $IMAGE_NAME:$APP_VERSION)"
+            log "  ✓ Image cleanup completed (kept only: $IMAGE_NAME:$APP_VERSION)"
             
             # Step 8: Cleanup temporary deployment files
             log "Step 8: Cleaning up temporary files..."
@@ -870,7 +882,7 @@ jobs:
             log "Container Status: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Status}}')"
             log "Container Ports: $(docker ps --filter name="$CONTAINER_NAME" --format '{{.Ports}}')"
             log "Image Version: $APP_VERSION"
-            log "Image Tags: latest, $APP_VERSION, $TIMESTAMP_TAG"
+            log "Image Tag: $IMAGE_NAME:$APP_VERSION"
             log "Git Commit: $GIT_COMMIT"
             
             echo ""
