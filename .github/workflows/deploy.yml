@@ -185,18 +185,40 @@ jobs:
               # Check logs for "Ready" message as fallback
               if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "Ready"; then
                 echo "✓ Container is ready (from logs)"
-                exit 0
+                break
               fi
               
               sleep 2
             done
             
-            echo "✗ Health check failed"
-            echo "Container status:"
-            docker ps --filter name="$CONTAINER_NAME" || true
-            echo "Container logs:"
-            docker logs "$CONTAINER_NAME" --tail 50
-            exit 1
+            # Verify health check passed
+            if ! docker ps --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+              echo "✗ Health check failed"
+              echo "Container status:"
+              docker ps --filter name="$CONTAINER_NAME" || true
+              echo "Container logs:"
+              docker logs "$CONTAINER_NAME" --tail 50
+              exit 1
+            fi
+            
+            # Cleanup old images - keep only current version
+            echo "Cleaning up old images..."
+            CURRENT_IMAGE_ID=$(docker images "${IMAGE_NAME}:${VERSION}" --format "{{.ID}}" 2>/dev/null | head -1 || echo "")
+            
+            if [ -n "$CURRENT_IMAGE_ID" ]; then
+              # Remove all images with different IDs (both registry and local tags)
+              docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -E "(shivawebapp|${IMAGE_NAME})" | while read -r img_tag img_id; do
+                [ -z "$img_tag" ] || [ -z "$img_id" ] && continue
+                if [ "$img_id" != "$CURRENT_IMAGE_ID" ]; then
+                  docker rmi "$img_tag" 2>/dev/null || docker rmi "$img_id" 2>/dev/null || true
+                fi
+              done || true
+              
+              # Remove dangling images (<none> tags)
+              docker image prune -f 2>/dev/null || true
+              
+              echo "✓ Cleanup completed - kept only ${IMAGE_NAME}:${VERSION}"
+            fi
 
   # ============================================
   # CD: Deploy to Production
@@ -270,15 +292,37 @@ jobs:
               # Check logs for "Ready" message as fallback
               if docker logs "$CONTAINER_NAME" 2>&1 | grep -q "Ready"; then
                 echo "✓ Container is ready (from logs)"
-                exit 0
+                break
               fi
               
               sleep 3
             done
             
-            echo "✗ Health check failed"
-            echo "Container status:"
-            docker ps --filter name="$CONTAINER_NAME" || true
-            echo "Container logs:"
-            docker logs "$CONTAINER_NAME" --tail 50
-            exit 1
+            # Verify health check passed
+            if ! docker ps --filter name="$CONTAINER_NAME" --format "{{.Names}}" | grep -q "^${CONTAINER_NAME}$"; then
+              echo "✗ Health check failed"
+              echo "Container status:"
+              docker ps --filter name="$CONTAINER_NAME" || true
+              echo "Container logs:"
+              docker logs "$CONTAINER_NAME" --tail 50
+              exit 1
+            fi
+            
+            # Cleanup old images - keep only current version
+            echo "Cleaning up old images..."
+            CURRENT_IMAGE_ID=$(docker images "${IMAGE_NAME}:${VERSION}" --format "{{.ID}}" 2>/dev/null | head -1 || echo "")
+            
+            if [ -n "$CURRENT_IMAGE_ID" ]; then
+              # Remove all images with different IDs (both registry and local tags)
+              docker images --format "{{.Repository}}:{{.Tag}} {{.ID}}" | grep -E "(shivawebapp|${IMAGE_NAME})" | while read -r img_tag img_id; do
+                [ -z "$img_tag" ] || [ -z "$img_id" ] && continue
+                if [ "$img_id" != "$CURRENT_IMAGE_ID" ]; then
+                  docker rmi "$img_tag" 2>/dev/null || docker rmi "$img_id" 2>/dev/null || true
+                fi
+              done || true
+              
+              # Remove dangling images (<none> tags)
+              docker image prune -f 2>/dev/null || true
+              
+              echo "✓ Cleanup completed - kept only ${IMAGE_NAME}:${VERSION}"
+            fi
