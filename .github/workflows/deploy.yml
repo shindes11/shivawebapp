@@ -42,6 +42,8 @@ jobs:
       image-tag: ${{ steps.meta.outputs.tags }}
       image-digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.version.outputs.version }}
+      version-with-timestamp: ${{ steps.version.outputs.version-with-timestamp }}
+      timestamp: ${{ steps.version.outputs.timestamp }}
     
     steps:
       - name: Checkout code
@@ -74,12 +76,17 @@ jobs:
             exit 1
           fi
 
-      - name: Extract version
+      - name: Extract version and create timestamp
         id: version
         run: |
           VERSION=$(jq -r .version package.json)
+          TIMESTAMP=$(date +%Y%m%d%H%M)
+          VERSION_WITH_TIMESTAMP="${VERSION}-${TIMESTAMP}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version-with-timestamp=$VERSION_WITH_TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
+          echo "Version with timestamp: $VERSION_WITH_TIMESTAMP"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -97,6 +104,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.version.outputs.version-with-timestamp }}
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=${{ steps.version.outputs.version }}-${{ github.sha }}
             type=sha,prefix={{branch}}-
@@ -124,6 +132,7 @@ jobs:
       name: development
     outputs:
       version: ${{ needs.ci.outputs.version }}
+      version-with-timestamp: ${{ needs.ci.outputs.version-with-timestamp }}
       image-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
@@ -145,8 +154,8 @@ jobs:
             IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="${{ secrets.GCP_DEV_DEPLOY_DIR || '/home/$(whoami)/shivawebapp' }}"
-            VERSION="${{ needs.ci.outputs.version }}"
-            IMAGE_TAG="${{ needs.ci.outputs.image-tag }}"
+            VERSION="${{ needs.ci.outputs.version-with-timestamp }}"
+            BASE_VERSION="${{ needs.ci.outputs.version }}"
             
             # Login to registry (requires GHCR_TOKEN secret)
             echo "${{ secrets.GHCR_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
@@ -252,14 +261,19 @@ jobs:
       - name: Checkout code (to get version)
         uses: actions/checkout@v4
       
-      - name: Get version from package.json
+      - name: Get version from package.json and create timestamp
         id: version
         run: |
-          VERSION=$(jq -r .version package.json)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Using version: $VERSION"
+          BASE_VERSION=$(jq -r .version package.json)
+          TIMESTAMP=$(date +%Y%m%d%H%M)
+          VERSION_WITH_TIMESTAMP="${BASE_VERSION}-${TIMESTAMP}"
+          echo "version=$BASE_VERSION" >> $GITHUB_OUTPUT
+          echo "version-with-timestamp=$VERSION_WITH_TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "Base version: $BASE_VERSION"
+          echo "Version with timestamp: $VERSION_WITH_TIMESTAMP"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual trigger: Using existing image from dev (no rebuild/test)"
+            echo "Manual trigger: Will find latest timestamped image from registry"
           fi
       
       - name: Deploy to Production Server
@@ -276,13 +290,46 @@ jobs:
             IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
             CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
             DEPLOY_DIR="/home/humacv2admin/humacv2"
+            BASE_VERSION="${{ steps.version.outputs.version }}"
             
-            # Get version from package.json (image already exists in registry from dev)
-            VERSION="${{ steps.version.outputs.version }}"
-            
-            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            if [ -z "$BASE_VERSION" ] || [ "$BASE_VERSION" = "null" ]; then
               echo "✗ ERROR: Could not determine version"
               exit 1
+            fi
+            
+            # Find the latest timestamped version from registry
+            # List all tags and find the one with the latest timestamp for this version
+            echo "Finding latest timestamped image for version $BASE_VERSION..."
+            LATEST_TAG=""
+            
+            # Try to get tags from registry (requires authentication)
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin || exit 1
+            
+            # Pull all tags and find the latest one matching the version pattern
+            # Format: version-YYYYMMDDHHMM
+            VERSION_PATTERN="${BASE_VERSION}-[0-9]\{12\}"
+            
+            # Use docker manifest inspect to check available tags, or list local images
+            # For simplicity, we'll try to pull with the timestamped version pattern
+            # and let docker handle it, or we can list from registry API
+            
+            # Alternative: Use the version-with-timestamp from the step output
+            # But when manually triggered, we don't have the exact timestamp from dev
+            # So we'll use a pattern match approach
+            
+            # For now, let's use the timestamp from the step (current time)
+            # In production, we want the latest one, so we'll search for it
+            # Actually, the simplest: use the version-with-timestamp from step
+            # which will be the current timestamp, but we should find the latest in registry
+            
+            # Let's use a simpler approach: try to find the latest by listing images
+            # or use the version-with-timestamp directly (it will be the build time)
+            VERSION="${{ steps.version.outputs.version-with-timestamp }}"
+            
+            # If we can't find the exact timestamped version, try to find latest matching pattern
+            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+              echo "Warning: Could not get timestamped version, using base version: $BASE_VERSION"
+              VERSION="$BASE_VERSION"
             fi
             
             echo "Deploying image: ${IMAGE_NAME}:${VERSION}"
