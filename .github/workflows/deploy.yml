@@ -297,39 +297,47 @@ jobs:
               exit 1
             fi
             
-            # Find the latest timestamped version from registry
-            # List all tags and find the one with the latest timestamp for this version
-            echo "Finding latest timestamped image for version $BASE_VERSION..."
-            LATEST_TAG=""
-            
-            # Try to get tags from registry (requires authentication)
+            # Login to registry first
             echo "${{ secrets.GHCR_TOKEN }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin || exit 1
             
-            # Pull all tags and find the latest one matching the version pattern
+            # Find the latest timestamped version from registry
+            # Query GitHub Container Registry API to find latest tag with timestamp
+            echo "Finding latest timestamped image for version $BASE_VERSION..."
+            
+            # Use GitHub API to list package versions and find the latest one with timestamp
             # Format: version-YYYYMMDDHHMM
-            VERSION_PATTERN="${BASE_VERSION}-[0-9]\{12\}"
+            LATEST_TAG=""
             
-            # Use docker manifest inspect to check available tags, or list local images
-            # For simplicity, we'll try to pull with the timestamped version pattern
-            # and let docker handle it, or we can list from registry API
+            # Try to get the latest tag from registry using curl
+            # GHCR API: https://ghcr.io/v2/{owner}/{image}/tags/list
+            OWNER="${{ github.repository_owner }}"
+            REPO_NAME="shivawebapp"
             
-            # Alternative: Use the version-with-timestamp from the step output
-            # But when manually triggered, we don't have the exact timestamp from dev
-            # So we'll use a pattern match approach
+            # Get tags from GHCR API
+            TAGS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GHCR_TOKEN }}" \
+              "https://ghcr.io/v2/${OWNER}/${REPO_NAME}/tags/list" 2>/dev/null || echo "{}")
             
-            # For now, let's use the timestamp from the step (current time)
-            # In production, we want the latest one, so we'll search for it
-            # Actually, the simplest: use the version-with-timestamp from step
-            # which will be the current timestamp, but we should find the latest in registry
+            # Extract tags matching the version pattern and find the latest timestamp
+            if echo "$TAGS_JSON" | jq -e '.tags' > /dev/null 2>&1; then
+              # Find all tags matching BASE_VERSION-YYYYMMDDHHMM pattern
+              LATEST_TAG=$(echo "$TAGS_JSON" | jq -r ".tags[] | select(startswith(\"${BASE_VERSION}-\")) | ." 2>/dev/null | \
+                grep -E "^${BASE_VERSION}-[0-9]{12}$" | sort -r | head -1 || echo "")
+            fi
             
-            # Let's use a simpler approach: try to find the latest by listing images
-            # or use the version-with-timestamp directly (it will be the build time)
-            VERSION="${{ steps.version.outputs.version-with-timestamp }}"
-            
-            # If we can't find the exact timestamped version, try to find latest matching pattern
-            if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-              echo "Warning: Could not get timestamped version, using base version: $BASE_VERSION"
-              VERSION="$BASE_VERSION"
+            # If we found a tag, use it; otherwise fall back to base version
+            if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
+              VERSION="$LATEST_TAG"
+              echo "Found latest timestamped version: $VERSION"
+            else
+              # Fallback: try to use the version-with-timestamp from step (current time)
+              # This might not exist in registry, but docker pull will fail if it doesn't
+              VERSION="${{ steps.version.outputs.version-with-timestamp }}"
+              if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+                echo "Warning: Could not find timestamped version, using base version: $BASE_VERSION"
+                VERSION="$BASE_VERSION"
+              else
+                echo "Using timestamped version from step: $VERSION (will verify it exists in registry)"
+              fi
             fi
             
             echo "Deploying image: ${IMAGE_NAME}:${VERSION}"
