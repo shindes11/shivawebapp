@@ -304,39 +304,52 @@ jobs:
             # Query GitHub Container Registry API to find latest tag with timestamp
             echo "Finding latest timestamped image for version $BASE_VERSION..."
             
-            # Use GitHub API to list package versions and find the latest one with timestamp
             # Format: version-YYYYMMDDHHMM
             LATEST_TAG=""
             
-            # Try to get the latest tag from registry using curl
-            # GHCR API: https://ghcr.io/v2/{owner}/{image}/tags/list
-            OWNER="${{ github.repository_owner }}"
-            REPO_NAME="shivawebapp"
-            
-            # Get tags from GHCR API
-            TAGS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GHCR_TOKEN }}" \
-              "https://ghcr.io/v2/${OWNER}/${REPO_NAME}/tags/list" 2>/dev/null || echo "{}")
-            
-            # Extract tags matching the version pattern and find the latest timestamp
-            if echo "$TAGS_JSON" | jq -e '.tags' > /dev/null 2>&1; then
-              # Find all tags matching BASE_VERSION-YYYYMMDDHHMM pattern
-              LATEST_TAG=$(echo "$TAGS_JSON" | jq -r ".tags[] | select(startswith(\"${BASE_VERSION}-\")) | ." 2>/dev/null | \
-                grep -E "^${BASE_VERSION}-[0-9]{12}$" | sort -r | head -1 || echo "")
+            # Check if curl and jq are available
+            if command -v curl > /dev/null 2>&1 && command -v jq > /dev/null 2>&1; then
+              # Try to get the latest tag from registry using curl
+              # GHCR API: https://ghcr.io/v2/{owner}/{image}/tags/list
+              OWNER="${{ github.repository_owner }}"
+              REPO_NAME="shivawebapp"
+              
+              # Get tags from GHCR API
+              TAGS_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GHCR_TOKEN }}" \
+                "https://ghcr.io/v2/${OWNER}/${REPO_NAME}/tags/list" 2>/dev/null || echo "{}")
+              
+              # Extract tags matching the version pattern and find the latest timestamp
+              if echo "$TAGS_JSON" | jq -e '.tags' > /dev/null 2>&1; then
+                # Find all tags matching BASE_VERSION-YYYYMMDDHHMM pattern
+                LATEST_TAG=$(echo "$TAGS_JSON" | jq -r ".tags[] | select(startswith(\"${BASE_VERSION}-\")) | ." 2>/dev/null | \
+                  grep -E "^${BASE_VERSION}-[0-9]{12}$" | sort -r | head -1 || echo "")
+              fi
+            else
+              echo "curl or jq not available, will use fallback method"
             fi
             
-            # If we found a tag, use it; otherwise fall back to base version
+            # If we found a tag, use it; otherwise try to find from local images or use fallback
             if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
               VERSION="$LATEST_TAG"
-              echo "Found latest timestamped version: $VERSION"
+              echo "Found latest timestamped version from registry: $VERSION"
             else
-              # Fallback: try to use the version-with-timestamp from step (current time)
-              # This might not exist in registry, but docker pull will fail if it doesn't
-              VERSION="${{ steps.version.outputs.version-with-timestamp }}"
-              if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-                echo "Warning: Could not find timestamped version, using base version: $BASE_VERSION"
-                VERSION="$BASE_VERSION"
+              # Fallback: Try to find latest timestamped version from local images
+              LOCAL_TAG=$(docker images "${IMAGE_NAME}" --format "{{.Tag}}" 2>/dev/null | \
+                grep -E "^${BASE_VERSION}-[0-9]{12}$" | sort -r | head -1 || echo "")
+              
+              if [ -n "$LOCAL_TAG" ]; then
+                VERSION="$LOCAL_TAG"
+                echo "Found latest timestamped version from local images: $VERSION"
               else
-                echo "Using timestamped version from step: $VERSION (will verify it exists in registry)"
+                # Final fallback: use the version-with-timestamp from step
+                # This will be the current timestamp, which should match the latest build
+                VERSION="${{ steps.version.outputs.version-with-timestamp }}"
+                if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+                  echo "Warning: Could not find timestamped version, using base version: $BASE_VERSION"
+                  VERSION="$BASE_VERSION"
+                else
+                  echo "Using timestamped version from step: $VERSION"
+                fi
               fi
             fi
             
